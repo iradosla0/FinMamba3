@@ -1,0 +1,12 @@
+setuptools==69.5.1
+packaging>=24.0
+ninja>=1.11
+PyYAML>=6.0
+einops==0.8.0
+tqdm==4.66.4
+numpy>=2,<3
+pandas>=2.2,<3
+pyarrow>=15.0
+gymnasium>=1.0,<2
+wandb
+pytorch_warmup==0.1.1

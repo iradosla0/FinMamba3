@@ -1,0 +1,201 @@
+BasicSettings:
+  ObsMode: features
+  FeatureDim: 94          # K(10) * F_level(8) + F_tick(14)
+  ReplayBufferOnGPU: True
+  Seed: 3710
+  Env_name: LOB
+  Device: cuda:0
+  Use_amp: True
+  NormClip: 8.0
+  Use_cg: False           # disables CUDA-graph caching in the Mamba decoding path
+  Compile: False          # torch.compile adds startup time; disable for short runs
+  SavePath: None
+
+Evaluate:
+  EpisodeNum: 10
+  NumEnvs: 1
+  DuringTraining: False
+  EverySteps: 1000
+
+JointTrainAgent:
+  SampleMaxSteps: 20000
+  BufferMaxLength: 50000
+  WorldModelWarmUp: 64
+  BehaviourWarmUp: 1000000   # effectively disables agent training
+  NumEnvs: 1
+  BatchSize: 64
+  AccumSteps: 2        # effective batch = BatchSize * AccumSteps = 128
+  BatchLength: 64
+  ImagineBatchSize: 64
+  ImagineContextLength: 8
+  ImagineBatchLength: 16
+  RealityContextLength: 16
+  TrainDynamicsEverySteps: 1
+  TrainDynamicsEpoch: 1
+  TrainAgentEverySteps: 1
+  FreezeWorldModelAfterSteps: 20000
+  FreezeBehaviourAfterSteps: 0
+  SaveEverySteps: 2000
+  SaveModels: True
+  Tau: 10
+  ImaginationTau: 10
+  Alpha: 1.0
+  Beta: 1.0
+
+Models:
+  WorldModel:
+    dtype: float32
+    Backbone: Mamba
+    Act: SiLU
+    # DreamerV3 (Hafner et al. 2023) uses 32x32 = 1024 across every domain. We
+    # shrink to 16x16 = 256 because the LOB-aggregate input is only 94 dims:
+    # 32x32 latent is a 10x EXPANSION over the input and stops acting as a
+    # bottleneck. 16x16 is still 2.7x expansion, preserving capacity while
+    # restoring some regularization pressure. Revert to 32 if reconstruction
+    # collapses or KL stays pinned at the free-bits floor.
+    CategoricalDim: 16
+    ClassDim: 16
+    HiddenStateDim: 512
+    Optimiser: Laprop
+    LatentDiscreteType: naive
+    Max_grad_norm: 1000     # DreamerV3 default; loose by design for cross-domain robustness.
+    Warmup_steps: 500
+    LRSchedule: cosine      # 'constant' or 'cosine' (decays to LRMin over SampleMaxSteps after warmup).
+    LRMinRatio: 0.1         # Cosine floor as a fraction of the peak LR.
+    UseActionInput: True    # Phase A populates action=0; set False to drop the dead one-hot path.
+    DirectionThresholds: null   # Set to e.g. [0.0001, 0.001, 0.005, 0.01] for a multi-threshold sweep.
+    Dropout: 0.1
+    Unimix_ratio: 0.01
+    Weight_decay: 1.0e-4
+    Adam:
+      LearningRate: 1.0e-4
+    Laprop:
+      LearningRate: 4.0e-5
+      Epsilon: 1.0e-20
+    Encoder:
+      Type: lob
+      K: 10
+      FeatureDimLevel: 8
+      FeatureDimTick: 14
+      DModel: 128
+      NumLayers: 2
+      NumHeads: 4
+      DimFeedforward: 256
+      OutputFlattenDim: 1024
+      AggregateOnly: False
+      GradientCheckpointing: False   # Trade ~10% recompute for ~30% transformer activation memory if T4 OOMs.
+    Decoder:
+      Kind: mse              # 'mse' for Gaussian, 'studentt' for heavy-tailed log-likelihood.
+      HiddenDim: 512
+      NumLayers: 3
+      NuInit: 5.0            # Student-t degrees of freedom; ignored for 'mse'.
+      LearnableNu: True
+    Reward:
+      Enabled: false        # Phase A pretraining has no reward signal; gate the head off.
+      HiddenUnits: 256
+      LayerNum: 1
+    Termination:
+      Enabled: false        # Phase A has no episode boundaries; gate the head off.
+      HiddenUnits: 256
+      LayerNum: 1
+    Transformer:
+      FinalFeatureWidth: 4
+      NumLayers: 2
+      NumHeads: 8
+    Mamba:
+      n_layer: 2
+      d_intermediate: 0
+      ssm_cfg:
+        d_state: 16
+    Mamba3:
+      Enabled: true
+      n_layer: 4              # 2 was Drama-Atari default; 4 gives the world model real depth
+                              # over the LOB tick stream. Activation checkpointing on the
+                              # encoder is available if VRAM is tight.
+      is_mimo: true
+      mimo_rank: 4
+      d_state: 128            # Mamba-3 paper (arXiv:2603.15569) shows d_state=64 matches
+                              # Mamba-2 d_state=128 at the same perplexity; 128 is over-
+                              # provisioned but kept until empirical validation.
+      headdim: 64
+      chunk_size: 16
+      is_outproj_norm: false
+      rope_fraction: 0.5
+    Direction:
+      Enabled: True           # Auxiliary 3-class direction loss; cheap predictive signal.
+      NumClasses: 3           # 0=down, 1=flat, 2=up.
+      Threshold: 0.01         # Normalized-mid delta below this is bucketed as 'flat'.
+      LossWeight: 0.5         # Relative to reconstruction.
+      Dropout: 0.0
+    Regime:
+      Enabled: False
+      NumRegimes: 8
+      EmbedDim: 32
+    EpisodicMemory:
+      Enabled: False                # Default off; baseline run for the A/B.
+      Capacity: 50000               # Number of past hidden states retained on CPU.
+      TopK: 4                       # Nearest neighbours fused per query.
+      MinFillBeforeRetrieve: 1024   # Skip retrieval until the buffer has this many entries.
+      RetrieveEvery: 4              # CPU retrieval throttle (every N training steps).
+      UseNovelty: False             # When True, only writes whose KL novelty exceeds NoveltyThreshold are kept.
+      NoveltyThreshold: 0.0
+    Hawkes:
+      Enabled: False                # Auxiliary Poisson NLL on buy/sell event counts; needs event_counts data.
+      LossWeight: 0.1
+    Settlement:
+      Enabled: False                # Auxiliary BCE on the binary contract outcome; needs outcome labels.
+      LossWeight: 0.25
+
+  Agent:
+    dtype: float32
+    Policy: AC
+    Unimix_ratio: 0
+    AC:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EntropyCoef: 3.e-4
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.0e-5
+        Epsilon: 1.0e-5
+      Laprop:
+        LearningRate: 4.0e-5
+        Epsilon: 1.0e-20
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+    PPO:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EpsilonClip: 0.2
+      K_epochs: 3
+      Minibatch: 16384
+      CriticCoef: 1
+      EntropyCoef: 3.e-4
+      KL_threshold: 0.01
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.e-5
+        Epsilon: 1.0e-5
+      Laprop:
+        LearningRate: 4.0e-5
+        Epsilon: 1.0e-20
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+
+Wandb:
+  Init:
+    Mode: offline
+    Project: Drama_LOB_pretrain
+n: lob

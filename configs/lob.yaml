@@ -73,9 +73,9 @@ Models:
     RepresentationLossWeight: 0.1   # Beta on the representation-side KL term in the split KL.
     FreeBits: 1.0                   # Per-step KL floor in nats; KL is clipped to zero below this.
     Adam:
-      LearningRate: 1.0e-4
+      LearningRate: 1.0e-3
     Laprop:
-      LearningRate: 4.0e-5   # Reverted: the proven LR for the batch-64 config (reached val 368).
+      LearningRate: 4.0e-4   # Reverted: the proven LR for the batch-64 config (reached val 368).
       Epsilon: 1.0e-20
     Encoder:
       Type: lob
@@ -176,11 +176,11 @@ Models:
       Act: SiLU
       Optimiser: Laprop
       Adam:
-        LearningRate: 3.0e-5
-        Epsilon: 1.0e-5
+        LearningRate: 3.0e-4
+        Epsilon: 1.0e-4
       Laprop:
-        LearningRate: 4.0e-5
-        Epsilon: 1.0e-20
+        LearningRate: 4.0e-4
+        Epsilon: 1.0e-19
       Actor:
         HiddenUnits: 256
       Critic:

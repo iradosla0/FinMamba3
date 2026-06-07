@@ -21,6 +21,10 @@ _LOSS_NAMES = (
     "settlement_loss",
     "regime_loss",
     "total_loss",
+    "lw_repr",
+    "lw_direction",
+    "lw_hawkes",
+    "lw_settlement",
 )
 
 

@@ -224,6 +224,7 @@ class WorldModel(nn.Module):
             self.termination_decoder = None
         direction_cfg = config.Models.WorldModel.get('Direction', None)
         self.use_direction_head = bool(direction_cfg is not None and direction_cfg.get('Enabled', False))
+        self.learnable_loss_weights = bool(config.Models.WorldModel.get('LearnableLossWeights', False))
         if self.use_direction_head:
             self.direction_head = DirectionHead(
                 hidden_dim=self.hidden_state_dim,
@@ -231,13 +232,13 @@ class WorldModel(nn.Module):
                 dropout=float(direction_cfg.get('Dropout', 0.0)),
                 dtype=config.Models.WorldModel.dtype, device=device,
             )
-            self.direction_loss_weight = float(direction_cfg.get('LossWeight', 0.5))
+            _dir_w0 = float(direction_cfg.get('LossWeight', 0.5))
             self.direction_threshold = float(direction_cfg.get('Threshold', 1.0e-2))
             # Index of normalized midprice in the flat feature vector.
             self.midprice_index = int(enc_cfg.K) * int(enc_cfg.FeatureDimLevel)
         else:
             self.direction_head = None
-            self.direction_loss_weight = 0.0
+            _dir_w0 = 0.0
             self.direction_threshold = 0.0
             self.midprice_index = -1
         if self.use_regime:
@@ -293,10 +294,10 @@ class WorldModel(nn.Module):
                 dtype=config.Models.WorldModel.dtype,
                 device=device,
             )
-            self.hawkes_loss_weight = float(hawkes_cfg.get('LossWeight', 0.1))
+            _hawkes_w0 = float(hawkes_cfg.get('LossWeight', 0.1))
         else:
             self.hawkes_head = None
-            self.hawkes_loss_weight = 0.0
+            _hawkes_w0 = 0.0
         settle_cfg = config.Models.WorldModel.get('Settlement', None)
         self.use_settlement_head = bool(
             settle_cfg is not None and settle_cfg.get('Enabled', False)
@@ -307,10 +308,25 @@ class WorldModel(nn.Module):
                 dtype=config.Models.WorldModel.dtype,
                 device=device,
             )
-            self.settlement_loss_weight = float(settle_cfg.get('LossWeight', 0.25))
+            _settle_w0 = float(settle_cfg.get('LossWeight', 0.25))
         else:
             self.settlement_head = None
-            self.settlement_loss_weight = 0.0
+            _settle_w0 = 0.0
+        # Four auxiliary weights [repr, direction, hawkes, settlement] live on
+        # the probability simplex so they stay non-negative and sum to 1.
+        _repr_w0 = float(config.Models.WorldModel.get('RepresentationLossWeight', 0.1))
+        if self.learnable_loss_weights:
+            raw = torch.tensor(
+                [_repr_w0, _dir_w0, _hawkes_w0, _settle_w0],
+                dtype=torch.float32,
+                device=device,
+            )
+            self._aux_weights = nn.Parameter(self._simplex_project(raw))
+        else:
+            self.representation_loss_weight = _repr_w0
+            self.direction_loss_weight = _dir_w0
+            self.hawkes_loss_weight = _hawkes_w0
+            self.settlement_loss_weight = _settle_w0
         # When DirectionThresholds is a list, the direction loss is computed at each threshold and averaged.
         # This replaces the single-threshold (1%) target with a curve over thresholds.
         self.direction_thresholds = config.Models.WorldModel.get('DirectionThresholds', None)
@@ -349,9 +365,7 @@ class WorldModel(nn.Module):
         # Larger values starve the dynamics signal; smaller values risk prior collapse.
         free_bits = float(config.Models.WorldModel.get('FreeBits', 1.0))
         self.categorical_kl_div_loss = CategoricalKLDivLossWithFreeBits(free_bits=free_bits)
-        # Representation loss weight controls how strongly the posterior is pulled toward the prior.
-        # DreamerV3 uses 0.5; the original Drama default is 0.1.
-        self.representation_loss_weight = float(config.Models.WorldModel.get('RepresentationLossWeight', 0.1))
+        # representation_loss_weight is initialized in the learnable-weights block above.
         if config.Models.WorldModel.Optimiser == 'Laprop':
             self.optimizer = LaProp(self.parameters(), lr=config.Models.WorldModel.Laprop.LearningRate, eps=config.Models.WorldModel.Laprop.Epsilon, weight_decay=config.Models.WorldModel.Weight_decay)
         elif config.Models.WorldModel.Optimiser == 'Adam':
@@ -383,6 +397,18 @@ class WorldModel(nn.Module):
             return dist_feat
         _, regime_emb = self.regime_head(dist_feat)
         return self.regime_conditioner(dist_feat, regime_emb)
+    @staticmethod
+    def _simplex_project(v: torch.Tensor) -> torch.Tensor:
+        """Project onto the probability simplex (Duchi et al. 2008)."""
+        v32 = v.float()
+        n = v32.shape[0]
+        u, _ = torch.sort(v32, descending=True)
+        cssv = torch.cumsum(u, dim=0)
+        steps = torch.arange(1, n + 1, dtype=torch.float32, device=v.device)
+        rho_mask = u * steps > (cssv - 1.0)
+        rho = rho_mask.nonzero(as_tuple=False)[-1].item()
+        theta = (cssv[rho] - 1.0) / (rho + 1.0)
+        return torch.clamp(v32 - theta, min=0.0).to(v.dtype)
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
@@ -680,12 +706,20 @@ class WorldModel(nn.Module):
                 regime_loss = (self.regime_film_entropy_coef * regime_load_balance_loss(regime_logits)).to(reconstruction_loss.dtype)
             else:
                 regime_loss = torch.zeros((), device=obs.device, dtype=reconstruction_loss.dtype)
+            if self.learnable_loss_weights:
+                aux_w = self._simplex_project(self._aux_weights)
+                repr_w, dir_w, hawkes_w, settle_w = aux_w[0], aux_w[1], aux_w[2], aux_w[3]
+            else:
+                repr_w = self.representation_loss_weight
+                dir_w = self.direction_loss_weight
+                hawkes_w = self.hawkes_loss_weight
+                settle_w = self.settlement_loss_weight
             total_loss = (
                 reconstruction_loss + reward_loss + termination_loss
-                + dynamics_loss + self.representation_loss_weight * representation_loss
-                + self.direction_loss_weight * direction_loss
-                + self.hawkes_loss_weight * hawkes_loss
-                + self.settlement_loss_weight * settlement_loss
+                + dynamics_loss + repr_w * representation_loss
+                + dir_w * direction_loss
+                + hawkes_w * hawkes_loss
+                + settle_w * settlement_loss
                 + regime_loss
             )
         # Catch bf16 selective_scan blowups during early training.
@@ -700,7 +734,7 @@ class WorldModel(nn.Module):
                 )
             self.optimizer.zero_grad(set_to_none=True)
             zero = torch.zeros((), device=total_loss.device, dtype=total_loss.dtype)
-            return (zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero)
+            return (zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero, zero)
         self._nan_skip_count = 0
         # Apply gradient update.
         self.scaler.scale(total_loss / accum_steps).backward()
@@ -710,6 +744,9 @@ class WorldModel(nn.Module):
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
+            if self.learnable_loss_weights:
+                with torch.no_grad():
+                    self._aux_weights.copy_(self._simplex_project(self._aux_weights))
             self.lr_scheduler.step()
             self.warmup_scheduler.dampen()
         # Stash the last-frame hidden state per batch element into episodic memory.
@@ -731,9 +768,18 @@ class WorldModel(nn.Module):
             self.episodic_memory.add(last_hidden, last_hidden, novelty=novelty)
         # Return detached tensors so the caller can stack and sync once per log step.
         # This avoids paying many GPU-CPU syncs per call to update.
+        if self.learnable_loss_weights:
+            aux_w = self._simplex_project(self._aux_weights).detach()
+            lw_repr, lw_dir, lw_hawkes, lw_settle = aux_w[0], aux_w[1], aux_w[2], aux_w[3]
+        else:
+            lw_repr = reconstruction_loss.detach().new_tensor(self.representation_loss_weight)
+            lw_dir = reconstruction_loss.detach().new_tensor(self.direction_loss_weight)
+            lw_hawkes = reconstruction_loss.detach().new_tensor(self.hawkes_loss_weight)
+            lw_settle = reconstruction_loss.detach().new_tensor(self.settlement_loss_weight)
         return (
             reconstruction_loss.detach(), reward_loss.detach(), termination_loss.detach(),
             dynamics_loss.detach(), dynamics_real_kl_div.detach(), representation_loss.detach(),
             representation_real_kl_div.detach(), direction_loss.detach(),
             hawkes_loss.detach(), settlement_loss.detach(), regime_loss.detach(), total_loss.detach(),
+            lw_repr, lw_dir, lw_hawkes, lw_settle,
         )

@@ -71,6 +71,8 @@ Models:
     Unimix_ratio: 0.01
     Weight_decay: 1.0e-4
     RepresentationLossWeight: 0.1   # Beta on the representation-side KL term in the split KL.
+    LearnableLossWeights: False     # When True, direction/hawkes/settlement/repr weights become nn.Parameters
+                                    # projected onto a simplex after each optimizer step.
     FreeBits: 1.0                   # Per-step KL floor in nats; KL is clipped to zero below this.
     Adam:
       LearningRate: 1.0e-3
@@ -91,7 +93,7 @@ Models:
       AggregateOnly: False
       GradientCheckpointing: False   # Trade ~10% recompute for ~30% transformer activation memory if T4 OOMs.
     Decoder:
-      Kind: mse              # 'mse' for Gaussian, 'studentt' for heavy-tailed log-likelihood.
+      Kind: studentt         # 'mse' for Gaussian, 'studentt' for heavy-tailed log-likelihood.
       HiddenDim: 512
       NumLayers: 3
       NuInit: 5.0            # Student-t degrees of freedom; ignored for 'mse'.

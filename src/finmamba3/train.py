@@ -79,7 +79,9 @@ def imagine_rollout(
             prior_logits = world_model.dist_head.forward_prior(feat)
             prior_sample = world_model.straight_through_gradient(prior_logits)
             prior_flat = world_model.flatten_sample(prior_sample)
-            decoded.append(world_model.obs_decoder(prior_flat).float().cpu().numpy()[0, 0])
+            _dec_out = world_model.obs_decoder(prior_flat)
+            _dec_tensor = _dec_out[0] if world_model.decoder_kind == 'studentt' else _dec_out
+            decoded.append(_dec_tensor.float().cpu().numpy()[0, 0])
             if step != horizon - 1:
                 next_action = torch.zeros((1, 1), dtype=torch.float32, device=device)
                 prefix_latent = torch.cat([prefix_latent, prior_flat], dim=1)

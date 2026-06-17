@@ -228,18 +228,15 @@ class SettlementHead(nn.Module):
         outcome: torch.Tensor,
         time_to_expiry_frac: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Binary cross-entropy, optionally weighted by closeness to expiry.
-
-        time_to_expiry_frac in [0, 1]: 1 at start, 0 at expiry. Weighting by
-        (1 - frac) puts more pressure near expiry where the binary outcome
-        becomes most predictable.
-        """
+        mask = torch.isfinite(outcome)
+        if not mask.any():
+            return logits.new_tensor(0.0)
+        logits = logits[mask]
+        outcome = outcome[mask].to(logits.dtype)
         if time_to_expiry_frac is None:
-            return F.binary_cross_entropy_with_logits(logits, outcome.to(logits.dtype))
-        weight = (1.0 - time_to_expiry_frac.clamp(min=0.0, max=1.0)).to(logits.dtype)
-        per = F.binary_cross_entropy_with_logits(
-            logits, outcome.to(logits.dtype), reduction="none"
-        )
+            return F.binary_cross_entropy_with_logits(logits, outcome)
+        weight = (1.0 - time_to_expiry_frac[mask].clamp(min=0.0, max=1.0)).to(logits.dtype)
+        per = F.binary_cross_entropy_with_logits(logits, outcome, reduction="none")
         return (per * weight).mean()
 
 

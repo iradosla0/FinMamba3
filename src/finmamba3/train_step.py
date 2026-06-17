@@ -46,7 +46,7 @@ def train_world_model_step(
     for e in range(epoch):
         accum_stacks: list[list[torch.Tensor]] = [[] for _ in _LOSS_NAMES]
         for a in range(accum_steps):
-            obs, action, reward, termination = replay_buffer.sample(
+            obs, action, reward, termination, outcome = replay_buffer.sample(
                 batch_size, batch_length, imagine=False
             )
             losses = world_model.update(
@@ -59,6 +59,7 @@ def train_world_model_step(
                 logger=logger,
                 accum_steps=accum_steps,
                 is_last_accum=(a == accum_steps - 1),
+                outcome=outcome,
             )
             if should_log:
                 for i, v in enumerate(losses):

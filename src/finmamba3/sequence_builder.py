@@ -39,11 +39,18 @@ def populate_buffer(buffer: ReplayBuffer, seq: LOBSequence) -> None:
     flat = seq.to_flat()
     T = flat.shape[0]
     for t in range(T):
+        import math
+        if seq.yes_outcome is not None and t < len(seq.yes_outcome):
+            _o = seq.yes_outcome[t]
+            outcome_t = float('nan') if (_o is None or (isinstance(_o, float) and math.isnan(_o))) else float(_o)
+        else:
+            outcome_t = float('nan')
         buffer.append(
             obs=flat[t],
             action=0,
             reward=0.0,
             termination=0.0,
+            outcome=outcome_t,
         )
     logger.info(f"replay buffer: loaded {T} ticks for market {seq.market_slug}")
 

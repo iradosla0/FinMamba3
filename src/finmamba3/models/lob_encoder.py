@@ -165,11 +165,15 @@ class LOBReconstructionLoss(nn.Module):
         tick_size_indices=DEFAULT_TICK_SIZE_INDICES,
     ) -> None:
         super().__init__()
-        level_w = torch.full((f_level,), level_weight, dtype=torch.float32)
-        _safe_assign(level_w, level_size_indices, size_weight)
         tick_w = torch.full((f_tick,), tick_weight, dtype=torch.float32)
         _safe_assign(tick_w, tick_size_indices, size_weight)
-        weight = torch.cat([level_w.repeat(k_levels), tick_w], dim=0)
+        level_blocks = []
+        for k in range(k_levels):
+            decay = 1.0 / (1.0 + 0.3 * k)
+            lw = torch.full((f_level,), level_weight * decay, dtype=torch.float32)
+            _safe_assign(lw, level_size_indices, size_weight * decay)
+            level_blocks.append(lw)
+        weight = torch.cat(level_blocks + [tick_w], dim=0)
         weight = weight * (weight.numel() / weight.sum())
         self.register_buffer("feature_weight", weight, persistent=False)
     def forward(self, obs_hat: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
@@ -262,11 +266,15 @@ class StudentTReconstructionLoss(nn.Module):
         tick_size_indices=DEFAULT_TICK_SIZE_INDICES,
     ) -> None:
         super().__init__()
-        level_w = torch.full((f_level,), level_weight, dtype=torch.float32)
-        _safe_assign(level_w, level_size_indices, size_weight)
         tick_w = torch.full((f_tick,), tick_weight, dtype=torch.float32)
         _safe_assign(tick_w, tick_size_indices, size_weight)
-        weight = torch.cat([level_w.repeat(k_levels), tick_w], dim=0)
+        level_blocks = []
+        for k in range(k_levels):
+            decay = 1.0 / (1.0 + 0.3 * k)
+            lw = torch.full((f_level,), level_weight * decay, dtype=torch.float32)
+            _safe_assign(lw, level_size_indices, size_weight * decay)
+            level_blocks.append(lw)
+        weight = torch.cat(level_blocks + [tick_w], dim=0)
         weight = weight * (weight.numel() / weight.sum())
         self.register_buffer("feature_weight", weight, persistent=False)
     def forward(

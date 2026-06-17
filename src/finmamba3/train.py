@@ -32,7 +32,14 @@ from finmamba3.envs.fi2010_loader import FLAT_FEATURE_NAMES_FI2010
 from finmamba3.config import DotDict, parse_args_and_update_config
 from finmamba3.replay_buffer import ReplayBuffer
 from finmamba3.train_step import train_world_model_step
-from finmamba3.sequence_builder import build_fi2010_sequences, build_sequences, populate_buffer
+from finmamba3.sequence_builder import (
+    build_fi2010_sequences,
+    build_kaggle_sequences,
+    build_market_sequences,
+    build_sequences,
+    populate_buffer,
+    populate_buffer_multi,
+)
 # endregion
 logger = logging.getLogger(__name__)
 SRC_DIR = Path(__file__).resolve().parents[1]
@@ -79,9 +86,11 @@ def imagine_rollout(
             prior_logits = world_model.dist_head.forward_prior(feat)
             prior_sample = world_model.straight_through_gradient(prior_logits)
             prior_flat = world_model.flatten_sample(prior_sample)
-            _dec_out = world_model.obs_decoder(prior_flat)
-            _dec_tensor = _dec_out[0] if world_model.decoder_kind == 'studentt' else _dec_out
-            decoded.append(_dec_tensor.float().cpu().numpy()[0, 0])
+            # The studentt decoder returns (mean, log_scale); the rollout trajectory is the predicted
+            # mean, so take the first element. The Gaussian decoder returns the prediction directly.
+            decoder_out = world_model.obs_decoder(prior_flat)
+            mean_out = decoder_out[0] if world_model.decoder_kind == "studentt" else decoder_out
+            decoded.append(mean_out.float().cpu().numpy()[0, 0])
             if step != horizon - 1:
                 next_action = torch.zeros((1, 1), dtype=torch.float32, device=device)
                 prefix_latent = torch.cat([prefix_latent, prior_flat], dim=1)
@@ -141,13 +150,15 @@ def _validation_metrics(
         post_logits = world_model.dist_head.forward_post(embedding)
         sample = world_model.straight_through_gradient(post_logits)
         flattened_sample = world_model.flatten_sample(sample)
+        # The studentt decoder returns (mean, log_scale) and its loss is the weighted NLL over both;
+        # the Gaussian decoder returns a single tensor scored by weighted MSE. Mirror update() so the
+        # studentt arm's Val/reconstruction_loss is the NLL that SaveBestOnly and early stopping read.
         decoder_out = world_model.obs_decoder(flattened_sample)
-        if world_model.decoder_kind == 'studentt':
-            obs_hat_mean, obs_hat_log_scale = decoder_out
+        if world_model.decoder_kind == "studentt":
+            recon_mean, recon_log_scale = decoder_out
             reconstruction_loss = world_model.reconstruction_loss_func(
-                world_model.obs_decoder, obs_hat_mean, obs_hat_log_scale, obs
+                world_model.obs_decoder, recon_mean, recon_log_scale, obs
             )
-            obs_hat = obs_hat_mean  # use mean for MSE/direction metrics below
         else:
             obs_hat = decoder_out
             reconstruction_loss = world_model.reconstruction_loss_func(obs_hat, obs)
@@ -162,11 +173,10 @@ def _validation_metrics(
         prior_logits = world_model.dist_head.forward_prior(dist_feat[:, :-1])
         prior_sample = world_model.straight_through_gradient(prior_logits, sample_mode="probs")
         prior_flat = world_model.flatten_sample(prior_sample)
-        next_hat_out = world_model.obs_decoder(prior_flat)
-        if world_model.decoder_kind == 'studentt':
-            next_hat = next_hat_out[0]  # mean only; log_scale not needed here
-        else:
-            next_hat = next_hat_out
+        # The one-step prediction MSE diagnostic compares the predicted mean to the next tick, so take
+        # the studentt mean; the Gaussian decoder already returns that mean directly.
+        prior_decode = world_model.obs_decoder(prior_flat)
+        next_hat = prior_decode[0] if world_model.decoder_kind == "studentt" else prior_decode
     target_next = obs[:, 1:].detach().float()
     pred_next = next_hat.detach().float()
     diff = pred_next - target_next
@@ -237,17 +247,54 @@ def _validation_metrics(
 validate = _validation_metrics
 
 
-def _gpu_monitor(interval: int = 30) -> None:
+def _gpu_monitor(interval: int = 30, sample_every: float = 2.0) -> None:
+    # A single instantaneous nvidia-smi snapshot lands on an arbitrary instant of a
+    # multi-second step and badly under-reads util. Sample across the whole window and
+    # report mean + peak so the logged number reflects sustained occupancy.
+    samples_per_window = max(1, int(interval / sample_every))
     while True:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            util, mem_used, mem_total = result.stdout.strip().split(", ")
-            logger.info(f"[GPU] util={util}%  mem={mem_used}/{mem_total} MiB")
-        time.sleep(interval)
+        utils = []
+        mem_used, mem_total = "?", "?"
+        for _ in range(samples_per_window):
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                util, mem_used, mem_total = result.stdout.strip().split(", ")
+                utils.append(int(util))
+            time.sleep(sample_every)
+        if utils:
+            mean_util = sum(utils) // len(utils)
+            logger.info(f"[GPU] util mean={mean_util}% peak={max(utils)}% mem={mem_used}/{mem_total} MiB")
+
+
+def _upload_checkpoints_async(folder: str, repo_id: str, token: str, lock: threading.Lock,
+                              path_in_repo: str = "checkpoints/lob") -> None:
+    # Fire-and-forget HF sync on a daemon thread so the upload never stalls the training
+    # loop. The non-blocking lock drops the sync if a previous one is still in flight, so a
+    # slow upload cannot pile up behind a faster save cadence.
+    def _run():
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            from huggingface_hub import HfApi
+            HfApi().upload_folder(
+                folder_path=folder,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type="model",
+                token=token,
+                commit_message="Periodic checkpoint sync during training",
+            )
+            logger.info(f"[ckpt-sync] uploaded {folder} -> {repo_id}")
+        except Exception as exc:
+            # A transient network error must not kill a multi-hour run; log and retry next cadence.
+            logger.warning(f"[ckpt-sync] upload failed: {exc}")
+        finally:
+            lock.release()
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def main() -> None:
@@ -259,6 +306,11 @@ def main() -> None:
     pre_parser.add_argument("--data-val", type=Path,
                             default=SRC_DIR.parent / "data" / "validation")
     pre_parser.add_argument("--market-slug", default=None)
+    pre_parser.add_argument(
+        "--max-markets", type=int, default=None,
+        help="Train on the top-N longest markets (multi-market substrate). Default: "
+             "JointTrainAgent.MarketCount from the config, or 1 for single-market.",
+    )
     pre_parser.add_argument("--hours-train", type=float, default=6.0)
     pre_parser.add_argument("--hours-val", type=float, default=1.0)
     pre_parser.add_argument(
@@ -268,9 +320,31 @@ def main() -> None:
     pre_parser.add_argument("--norm-path", type=Path,
                             default=SRC_DIR.parent / "saved_models" / "lob" / "normalization.json")
     pre_parser.add_argument(
-        "--dataset", choices=("polymarket", "fi2010"), default=None,
+        "--dataset", choices=("polymarket", "fi2010", "kaggle"), default=None,
         help="Override Dataset.Kind from the config file.",
     )
+    pre_parser.add_argument(
+        "--resume-checkpoint", type=Path, default=None,
+        help="Warm-restart from this .pth (model + optimizer weights). The LR schedule "
+             "and step counter reset; best_val_loss seeds from the checkpoint so the new "
+             "run only saves a checkpoint when it beats the resumed one.",
+    )
+    pre_parser.add_argument(
+        "--ckpt-repo", default=None,
+        help="HF model repo id to sync checkpoints to during training (crash-safety).",
+    )
+    pre_parser.add_argument(
+        "--ckpt-upload-every", type=int, default=0,
+        help="Write the latest checkpoint and upload saved_models/<n> to --ckpt-repo every "
+             "N steps. 0 disables in-training upload (the run still saves locally).",
+    )
+    pre_parser.add_argument(
+        "--ckpt-path-in-repo", default="checkpoints/lob",
+        help="Destination folder inside --ckpt-repo for the checkpoint sync. Set this per-dataset "
+             "(e.g. mimo-ckpt/fi2010) so runs on different datasets do not collide in one folder, "
+             "which lets a fresh session find and resume the right checkpoint.",
+    )
+    pre_parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"))
     pre_args, remaining = pre_parser.parse_known_args()
     with open(pre_args.config, "r") as f:
         config = yaml.safe_load(f)
@@ -290,6 +364,8 @@ def main() -> None:
     logger.info(f"dataset pipeline: {dataset_kind}")
     norm_clip = config.BasicSettings.get("NormClip", 8.0)
     aggregate_only = config.Models.WorldModel.Encoder.get("AggregateOnly", False)
+    # The multi-market knob defaults to the config; 1 keeps the single-market path.
+    max_markets = pre_args.max_markets if pre_args.max_markets is not None else int(config.JointTrainAgent.get("MarketCount", 1))
     # Parse intervals if provided
     intervals = None
     if pre_args.intervals:
@@ -297,30 +373,78 @@ def main() -> None:
         logger.info(f"filtering markets to intervals: {intervals}")
     if dataset_kind == "polymarket":
         include_binary_features = config.Models.WorldModel.Encoder.BinaryMarketFeatures
-        logger.info(f"building train features from {pre_args.data_train}")
-        train_seq, slug, stats = build_sequences(
-            pre_args.data_train,
-            pre_args.market_slug,
-            pre_args.hours_train,
-            pre_args.norm_path,
-            fit_stats=True,
-            norm_clip=norm_clip,
-            aggregate_only=aggregate_only,
-            intervals=intervals,
-            include_binary_features=include_binary_features,
-        )
-        logger.info(f"building val features from {pre_args.data_val}")
-        val_seq, _, _ = build_sequences(
-            pre_args.data_val,
-            slug,
-            pre_args.hours_val,
-            pre_args.norm_path,
-            fit_stats=False,
-            norm_clip=norm_clip,
-            intervals=intervals,
-            aggregate_only=aggregate_only,
-            include_binary_features=include_binary_features,
-        )
+        # Phase 0.1/0.2/0.6: SpotFeatures appends the causal spot path, the time-to-expiry clock
+        # and the asset one-hot. Default off keeps the legacy 100-dim schema bit-identical.
+        include_spot_features = config.Models.WorldModel.Encoder.get('SpotFeatures', False)
+        # Phase 0.4: CrossIntervalContext appends the contemporaneous short-interval summary to hourly
+        # markets (zeros elsewhere). Default off; enabling it widens the schema by three channels.
+        include_cross_interval = config.Models.WorldModel.Encoder.get('CrossIntervalContext', False)
+        # Per-asset training: restrict the market pool to these asset symbols (e.g. ['ETH']) so the model
+        # learns one asset's dynamics; default None keeps the top markets across all assets (BTC-dominated).
+        train_assets = config.Models.WorldModel.Encoder.get('Assets', None)
+        logger.info(f"building train features from {pre_args.data_train} (max_markets={max_markets}, assets={train_assets})")
+        if max_markets > 1:
+            train_seqs, slugs, stats = build_market_sequences(
+                pre_args.data_train,
+                pre_args.market_slug,
+                pre_args.hours_train,
+                pre_args.norm_path,
+                fit_stats=True,
+                norm_clip=norm_clip,
+                aggregate_only=aggregate_only,
+                max_markets=max_markets,
+                intervals=intervals,
+                include_binary_features=include_binary_features,
+                include_spot_features=include_spot_features,
+                include_cross_interval=include_cross_interval,
+                assets=train_assets,
+            )
+            # The training-loop val metric reads one sequence; the longest val market
+            # is a stable, boundary-safe representative. Cross-market generalization is
+            # measured post-hoc by eval/regime_split.py + eval/compare_direction.py.
+            logger.info(f"building val features from {pre_args.data_val} (longest market)")
+            val_seq, _, _ = build_sequences(
+                pre_args.data_val,
+                None,
+                pre_args.hours_val,
+                pre_args.norm_path,
+                fit_stats=False,
+                norm_clip=norm_clip,
+                intervals=intervals,
+                aggregate_only=aggregate_only,
+                include_binary_features=include_binary_features,
+                include_spot_features=include_spot_features,
+                include_cross_interval=include_cross_interval,
+            )
+        else:
+            train_seq, slug, stats = build_sequences(
+                pre_args.data_train,
+                pre_args.market_slug,
+                pre_args.hours_train,
+                pre_args.norm_path,
+                fit_stats=True,
+                norm_clip=norm_clip,
+                aggregate_only=aggregate_only,
+                intervals=intervals,
+                include_binary_features=include_binary_features,
+                include_spot_features=include_spot_features,
+                include_cross_interval=include_cross_interval,
+            )
+            logger.info(f"building val features from {pre_args.data_val}")
+            val_seq, _, _ = build_sequences(
+                pre_args.data_val,
+                slug,
+                pre_args.hours_val,
+                pre_args.norm_path,
+                fit_stats=False,
+                norm_clip=norm_clip,
+                intervals=intervals,
+                aggregate_only=aggregate_only,
+                include_binary_features=include_binary_features,
+                include_spot_features=include_spot_features,
+                include_cross_interval=include_cross_interval,
+            )
+            train_seqs = [train_seq]
     elif dataset_kind == "fi2010":
         fi2010_cfg = dataset_cfg.get("FI2010", None) if dataset_cfg is not None else None
         horizon = int(fi2010_cfg.get("Horizon", 10)) if fi2010_cfg is not None else 10
@@ -341,9 +465,39 @@ def main() -> None:
         if aggregate_only:
             train_seq = make_aggregate_only(train_seq)
             val_seq = make_aggregate_only(val_seq)
+        # FI-2010 is a single sequence; the buffer's segment flags stay all-False.
+        train_seqs = [train_seq]
+    elif dataset_kind == "kaggle":
+        kaggle_cfg = dataset_cfg.get("Kaggle", None) if dataset_cfg is not None else None
+        if kaggle_cfg is None:
+            raise ValueError("Dataset.Kind=kaggle requires a Dataset.Kaggle config block (Asset/Resolution/HoursTrain/HoursVal).")
+        asset = str(kaggle_cfg.get("Asset", "BTC"))
+        resolution = str(kaggle_cfg.get("Resolution", "1min"))
+        hours_train = float(kaggle_cfg.get("HoursTrain", 168.0))
+        hours_val = float(kaggle_cfg.get("HoursVal", 72.0))
+        flat_threshold = float(kaggle_cfg.get("FlatThreshold", 0.0))
+        logger.info(f"loading Kaggle {asset} {resolution} train slice from {pre_args.data_train}")
+        train_seq, slug, stats = build_kaggle_sequences(
+            pre_args.data_train, asset=asset, resolution=resolution, split="train",
+            hours_train=hours_train, hours_val=hours_val, norm_path=pre_args.norm_path,
+            fit_stats=True, norm_clip=norm_clip, flat_threshold=flat_threshold,
+        )
+        logger.info(f"loading Kaggle {asset} {resolution} validation slice from {pre_args.data_val}")
+        val_seq, _, _ = build_kaggle_sequences(
+            pre_args.data_val, asset=asset, resolution=resolution, split="validation",
+            hours_train=hours_train, hours_val=hours_val, norm_path=pre_args.norm_path,
+            fit_stats=False, norm_clip=norm_clip, flat_threshold=flat_threshold,
+        )
+        if aggregate_only:
+            train_seq = make_aggregate_only(train_seq)
+            val_seq = make_aggregate_only(val_seq)
+        # Kaggle is a single continuous stream; the buffer's segment flags stay all-False.
+        train_seqs = [train_seq]
     else:
         raise ValueError(f"Unknown dataset kind: {dataset_kind!r}")
-    for split_name, seq in (("train", train_seq), ("val", val_seq)):
+    diag_targets = [(f"train[{i}]", seq) for i, seq in enumerate(train_seqs)]
+    diag_targets.append(("val", val_seq))
+    for split_name, seq in diag_targets:
         diag = normalized_feature_diagnostics(seq, stats.clip_value)
         top = ", ".join(f"{name}={value:.3f}" for name, value in diag["top_features"])
         logger.info(
@@ -357,8 +511,8 @@ def main() -> None:
             )
     # The config-driven assertion handles both Polymarket (94-dim) and FI-2010 (46-dim).
     # The legacy FEATURE_DIM_FLAT constant only applies to the Polymarket schema.
-    assert train_seq.to_flat().shape[1] == config.BasicSettings.FeatureDim, (
-        f"Feature dim mismatch: computed {train_seq.to_flat().shape[1]} "
+    assert train_seqs[0].to_flat().shape[1] == config.BasicSettings.FeatureDim, (
+        f"Feature dim mismatch: computed {train_seqs[0].to_flat().shape[1]} "
         f"vs config {config.BasicSettings.FeatureDim}"
     )
     action_dim = 1
@@ -366,6 +520,17 @@ def main() -> None:
     world_model = WorldModel(action_dim=action_dim, config=config, device=device).cuda(device)
     n_params = sum(p.numel() for p in world_model.parameters())
     logger.info(f"world model: {n_params:,} params, encoder_type={world_model.encoder_type}")
+    resume_best_val_loss = float('inf')
+    if pre_args.resume_checkpoint is not None:
+        ckpt = torch.load(pre_args.resume_checkpoint, map_location=device)
+        world_model.load_state_dict(ckpt["world_model"])
+        world_model.optimizer.load_state_dict(ckpt["optimizer"])
+        resume_best_val_loss = float(ckpt.get("best_val_loss", float('inf')))
+        logger.info(
+            f"warm-restart from {pre_args.resume_checkpoint}: trained-to step "
+            f"{ckpt.get('step', '?')}, best_val_loss={resume_best_val_loss:.4f}. "
+            f"LR schedule and step counter reset for the new run."
+        )
     # Probe the autocast/dtype path on a tiny batch so a misconfiguration shows
     # up before a 6-hour training run instead of after.
     try:
@@ -407,7 +572,10 @@ def main() -> None:
         except Exception as exc:
             logger.warning(f"torch.compile unavailable, running eager: {exc}")
     replay_buffer = ReplayBuffer(config, device=device)
-    populate_buffer(replay_buffer, train_seq)
+    if len(train_seqs) > 1:
+        populate_buffer_multi(replay_buffer, train_seqs)
+    else:
+        populate_buffer(replay_buffer, train_seqs[0])
     wlogger = make_logger(
         config=config,
         project=config.Wandb.Init.Project,
@@ -416,6 +584,11 @@ def main() -> None:
     logdir = f"./saved_models/{config.n}/{config.BasicSettings.Env_name}/{wlogger.run.id}"
     os.makedirs(f"{logdir}/ckpt", exist_ok=True)
     threading.Thread(target=_gpu_monitor, args=(30,), daemon=True).start()
+    ckpt_root = f"./saved_models/{config.n}"
+    upload_every = pre_args.ckpt_upload_every if (pre_args.ckpt_repo and pre_args.hf_token) else 0
+    upload_lock = threading.Lock()
+    if upload_every > 0:
+        logger.info(f"[ckpt-sync] syncing {ckpt_root} -> {pre_args.ckpt_repo} every {upload_every} steps")
     accum_steps = config.JointTrainAgent.get('AccumSteps', 1)
     log_every = config.JointTrainAgent.get('LogEvery', 50)
     max_steps = config.JointTrainAgent.SampleMaxSteps
@@ -424,9 +597,10 @@ def main() -> None:
     imagine_every = save_every
     # Early stopping config
     early_stopping_patience = config.JointTrainAgent.get('EarlyStoppingPatience', 0)
+    early_stop_metric = config.JointTrainAgent.get('EarlyStopMetric', 'Val/reconstruction_loss')
     save_best_only = config.JointTrainAgent.get('SaveBestOnly', False)
     # Tracking variables
-    best_val_loss = float('inf')
+    best_val_loss = resume_best_val_loss
     patience_counter = 0
     best_step = 0
     pbar = tqdm(range(max_steps), desc="pretrain", miniters=50, mininterval=0)
@@ -459,9 +633,22 @@ def main() -> None:
                     "validation top feature MSE: "
                     + ", ".join(f"{name}={value:.4g}" for name, value in top_mse)
                 )
+            # Echo the decision metrics to stdout so the offline log captures the
+            # thesis-relevant signal, not just the reconstruction ELBO the run
+            # early-stops on. NaN settlement metrics print as nan without breaking.
+            logger.info(
+                f"[val] step={step} "
+                f"recon={val_metrics.get('Val/reconstruction_loss', float('nan')):.4f} "
+                f"dir_acc={val_metrics.get('Val/mid_direction_accuracy', float('nan')):.4f} "
+                f"yes_log_loss={val_metrics.get('Val/yes_log_loss', float('nan')):.4f} "
+                f"yes_brier={val_metrics.get('Val/yes_brier', float('nan')):.4f}"
+            )
 
             # --- Early stopping & best checkpoint logic ---
-            current_val_loss = val_metrics.get('Val/reconstruction_loss', float('inf'))
+            current_val_loss = val_metrics.get(early_stop_metric, float('inf'))
+            if not np.isfinite(current_val_loss):
+                # When the selected metric is NaN this validation, fall through without comparing.
+                current_val_loss = float('inf')
 
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
@@ -480,7 +667,8 @@ def main() -> None:
                 if early_stopping_patience > 0:
                     logger.info(f"no improvement for {patience_counter}/{early_stopping_patience} validations")
 
-            pbar.set_postfix(val_loss=f"{current_val_loss:.4f}", best=f"{best_val_loss:.4f}")
+            dir_acc = val_metrics.get("Val/mid_direction_accuracy", float("nan"))
+            pbar.set_postfix(val_loss=f"{current_val_loss:.4f}", best=f"{best_val_loss:.4f}", dir_acc=f"{dir_acc:.3f}")
 
             # Early stopping check
             if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
@@ -494,6 +682,17 @@ def main() -> None:
                  "optimizer": world_model.optimizer.state_dict()},
                 f"{logdir}/ckpt/world_model.pth",
             )
+        if upload_every > 0 and step > 0 and step % upload_every == 0:
+            # Snapshot the latest weights, then push the whole checkpoint dir to HF so an
+            # interrupted run still leaves a recent model on the Hub. The save runs inline
+            # (it must finish before the async upload reads the file); the upload is detached.
+            torch.save(
+                {"step": step, "world_model": world_model.state_dict(),
+                 "optimizer": world_model.optimizer.state_dict()},
+                f"{logdir}/ckpt/world_model.pth",
+            )
+            _upload_checkpoints_async(ckpt_root, pre_args.ckpt_repo, pre_args.hf_token, upload_lock,
+                                      pre_args.ckpt_path_in_repo)
     # Save final checkpoint
     torch.save(
         {"step": step, "world_model": world_model.state_dict(),
@@ -504,6 +703,15 @@ def main() -> None:
     logger.info(f"best val_loss={best_val_loss:.4f} at step {best_step}")
     if save_best_only:
         logger.info(f"best checkpoint: {logdir}/ckpt/world_model_best.pth")
+    if upload_every > 0:
+        # Final synchronous flush so the very last weights land on HF before the process exits.
+        from huggingface_hub import HfApi
+        HfApi().upload_folder(
+            folder_path=ckpt_root, path_in_repo=pre_args.ckpt_path_in_repo,
+            repo_id=pre_args.ckpt_repo, repo_type="model", token=pre_args.hf_token,
+            commit_message="Final checkpoint sync",
+        )
+        logger.info(f"[ckpt-sync] final upload {ckpt_root} -> {pre_args.ckpt_repo}")
     wlogger.close()
 if __name__ == "__main__":
     main()

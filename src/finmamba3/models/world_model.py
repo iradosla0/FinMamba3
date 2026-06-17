@@ -327,7 +327,7 @@ class WorldModel(nn.Module):
                     self._aux_weights[2] = 0.0
                 if not self.use_settlement_head:
                     self._aux_weights[3] = 0.0
-                self._aux_weights.copy_(self._simplex_project(self._aux_weights))
+                self._aux_weights.copy_(self._simplex_project_masked(self._aux_weights))
             def _mask_grad_hook(grad):
                 mask = torch.ones_like(grad)
                 if not self.use_hawkes_head:
@@ -423,6 +423,26 @@ class WorldModel(nn.Module):
         rho = rho_mask.nonzero(as_tuple=False)[-1].item()
         theta = (cssv[rho] - 1.0) / (rho + 1.0)
         return torch.clamp(v32 - theta, min=0.0).to(v.dtype)
+    def _simplex_project_masked(self, v: torch.Tensor) -> torch.Tensor:
+        """Simplex projection that permanently holds disabled head weights at zero.
+
+        Only masks heads that are actually disabled. Settlement is enabled,
+        so only hawkes is zeroed when use_hawkes_head is False.
+        """
+        w = v.clone().float()
+        if not self.use_hawkes_head:
+            w[2] = 0.0
+        if not self.use_settlement_head:
+            w[3] = 0.0
+        active_mask = torch.ones(w.shape[0], dtype=torch.bool, device=w.device)
+        if not self.use_hawkes_head:
+            active_mask[2] = False
+        if not self.use_settlement_head:
+            active_mask[3] = False
+        active = w[active_mask]
+        projected = self._simplex_project(active)
+        w[active_mask] = projected
+        return w.to(v.dtype)
     def encode_obs(self, obs):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             embedding = self.encoder(obs)
@@ -760,7 +780,7 @@ class WorldModel(nn.Module):
             self.optimizer.zero_grad(set_to_none=True)
             if self.learnable_loss_weights:
                 with torch.no_grad():
-                    self._aux_weights.copy_(self._simplex_project(self._aux_weights))
+                    self._aux_weights.copy_(self._simplex_project_masked(self._aux_weights))
             self.lr_scheduler.step()
             self.warmup_scheduler.dampen()
         # Stash the last-frame hidden state per batch element into episodic memory.

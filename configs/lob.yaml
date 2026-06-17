@@ -19,15 +19,15 @@ Evaluate:
 
 JointTrainAgent:
   SampleMaxSteps: 50000   # Drives both the loop length and the cosine LR horizon (world_model.py t_max); 15k aligns annealing to the ~13k convergence point, early-stop still guards.
-  EarlyStoppingPatience: 5
+  EarlyStoppingPatience: 15
   SaveBestOnly: true
   BufferMaxLength: 50000
   WorldModelWarmUp: 64
   BehaviourWarmUp: 1000000   # effectively disables agent training
   NumEnvs: 1
-  BatchSize: 64        # Reverted from 512: the big batch converged worse (val 390 vs 368) and ran ~5x slower.
-  AccumSteps: 2        # Effective batch 128; the known-good config that reached val 368 in ~38 min.
-  BatchLength: 32
+  BatchSize: 32        # Reverted from 512: the big batch converged worse (val 390 vs 368) and ran ~5x slower.
+  AccumSteps: 2        
+  BatchLength: 64
   ImagineBatchSize: 64
   ImagineContextLength: 8
   ImagineBatchLength: 16

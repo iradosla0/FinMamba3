@@ -1,0 +1,238 @@
+BasicSettings:
+  ObsMode: features
+  FeatureDim: 100         # K(10) * F_level(8) + F_tick(20: 14 base + 6 binary-market)
+  ReplayBufferOnGPU: True
+  Seed: 3710
+  Env_name: LOB
+  Device: cuda:0
+  Use_amp: True
+  NormClip: 8.0
+  Use_cg: False
+  Compile: False
+  SavePath: None
+
+Evaluate:
+  EpisodeNum: 10
+  NumEnvs: 1
+  DuringTraining: False
+  EverySteps: 1000
+
+JointTrainAgent:
+  SampleMaxSteps: 3500    # ~8.5h at ~8.8 s/it on A100 with SISO. Cosine LR anneals
+                          # fully over this horizon. Raise to 5000 if the run finishes
+                          # early without plateauing; lower to 2000 for quick ablations.
+  EarlyStoppingPatience: 10  # Raised from 5: NLL baseline shifted with nu-clamp fix,
+                              # model needs more room to find new equilibrium.
+  SaveBestOnly: true
+  BufferMaxLength: 50000
+  WorldModelWarmUp: 64
+  BehaviourWarmUp: 1000000   # effectively disables agent training in Phase A
+  NumEnvs: 1
+  BatchSize: 1024      # A100 max-util recipe. MIMO scan kernel parallelism scales with
+                       # batch*heads*chunks; at batch 128 the A100 sits at ~0-1% util.
+                       # At 1024 it floods the card. NOTE: different regime from T4 val-368
+                       # numbers; do not compare reconstruction loss across configs.
+  AccumSteps: 1        # Single fused forward/backward at full batch; accumulation does
+                       # not raise SM occupancy and adds unnecessary sync overhead.
+  BatchLength: 64      # Doubled from T4 baseline: gives dynamics model 64 ticks of
+                       # context, capturing slower LOB drift beyond microstructure noise.
+  ImagineBatchSize: 64
+  ImagineContextLength: 8
+  ImagineBatchLength: 16
+  RealityContextLength: 16
+  TrainDynamicsEverySteps: 1
+  TrainDynamicsEpoch: 1
+  TrainAgentEverySteps: 1
+  FreezeWorldModelAfterSteps: 20000
+  FreezeBehaviourAfterSteps: 0
+  SaveEverySteps: 500   # Finer cadence for shorter run: validates at 250/500/1000/...
+  LogEvery: 50
+  SaveModels: True
+  Tau: 10
+  ImaginationTau: 10
+  Alpha: 1.0
+  Beta: 1.0
+
+Models:
+  WorldModel:
+    dtype: float32
+    Backbone: Mamba3
+    Act: SiLU
+    # Restored to DreamerV3 32x32=1024 latent. A100 has headroom; the T4 reduction
+    # to 16x16 was a memory constraint. With 94-dim LOB input, 32x32 is a 10x
+    # expansion — monitor KL to ensure the latent stays informative and does not
+    # collapse to the prior.
+    CategoricalDim: 32
+    ClassDim: 32
+    HiddenStateDim: 1024   # doubled from T4 512
+    Optimiser: Laprop
+    LatentDiscreteType: naive
+    Max_grad_norm: 100
+    Warmup_steps: 100      # 100/3500 = 2.9%, matching the ratio of the proven T4 run.
+                           # At 500 steps warmup would consume 14% of the run budget.
+    LRSchedule: cosine
+    LRMinRatio: 0.1
+    UseActionInput: True
+    DirectionThresholds: null
+    Dropout: 0.0           # Underfitting regime at this step count; dropout off.
+                           # Re-enable for Phase B fine-tuning if overfitting appears.
+    Unimix_ratio: 0.01
+    Weight_decay: 1.0e-4
+    RepresentationLossWeight: 0.1
+    LearnableLossWeights: True
+    FreeBits: 0.5          # Lowered from 1.0: tighter floor for the smaller LOB feature
+                           # space. 1.0 was calibrated for Atari image observations.
+    Adam:
+      LearningRate: 1.0e-3
+    Laprop:
+      LearningRate: 3.0e-4   # Rudy's sweep on 4080 at batch 1024: 3e-4 was the clear
+                              # optimum (recon 100 vs 119 at 1.5e-4 vs 191 at 4e-5).
+                              # Conservative at A100 batch 1024; sqrt-scaled aggressive
+                              # option would be ~8.5e-4 but is unvalidated.
+      Epsilon: 1.0e-20
+    Encoder:
+      Type: lob
+      K: 10
+      FeatureDimLevel: 8
+      FeatureDimTick: 20
+      BinaryMarketFeatures: True
+      DModel: 256            # doubled from T4 128
+      NumLayers: 2
+      NumHeads: 4
+      DimFeedforward: 512    # doubled from T4 256
+      OutputFlattenDim: 2048 # doubled from T4 1024
+      AggregateOnly: False
+      GradientCheckpointing: False
+    Decoder:
+      Kind: studentt         # Keeping StudentT — Rudy reverted to MSE but Ivan's nu-clamp
+                             # and log_scale fixes make StudentT viable. Pair with NuInit=5.0.
+      HiddenDim: 1024        # doubled from T4 512
+      NumLayers: 3
+      NuInit: 5.0
+      LearnableNu: True
+      SizeWeight: 2.0
+    Reward:
+      Enabled: false
+      HiddenUnits: 256
+      LayerNum: 1
+    Termination:
+      Enabled: false
+      HiddenUnits: 256
+      LayerNum: 1
+    Transformer:
+      FinalFeatureWidth: 4
+      NumLayers: 2
+      NumHeads: 8
+    Mamba:
+      n_layer: 2
+      d_intermediate: 0
+      ssm_cfg:
+        d_state: 16
+    Mamba3:
+      Enabled: true
+      n_layer: 6             # increased from T4 4: more depth for A100 capacity budget
+      is_mimo: true          # MIMO enabled — A100 fits chunk_size=8 at d_state=128
+      mimo_rank: 4           # SMEM ceiling on A100: rank 4 needs ~120 KB at chunk_size=8
+                             # (A100 has ~166 KB). rank 8 exceeds cap at any chunk_size.
+      d_state: 128
+      headdim: 64
+      chunk_size: 8          # CRITICAL: A100 requires 8, NOT 16. chunk_size=16 needs
+                             # ~219 KB shared memory; A100 only has ~166 KB. H100 can
+                             # use 16. Do not change this on A100.
+      is_outproj_norm: false
+      rope_fraction: 0.5
+    Direction:
+      Enabled: True
+      NumClasses: 3
+      Threshold: 0.01
+      LossWeight: 0.5
+      Dropout: 0.0
+    Regime:
+      Enabled: False
+      NumRegimes: 8
+      EmbedDim: 32
+    RegimeFiLM:
+      Enabled: False         # Baseline arm. For treatment arm: set True and also enable
+                             # SuperviseVol, FeedObsVol, DecoupleRouterFromFiLM per
+                             # Rudy's regime_modulation.py engineering notes.
+      NumRegimes: 8
+      EmbedDim: 32
+      EntropyCoef: 0.01
+      InitScale: 0.0         # Zero-init: untrained modulator is identity (gamma=1, beta=0)
+      Dropout: 0.0
+      LRMult: 1.0
+      ConditionOnVol: False
+      VolWindow: 16
+      SuperviseVol: False
+      SupervisionWeight: 0.0
+      SuperviseAxis: vol
+      FeedObsVol: False
+      DecoupleRouterFromFiLM: False
+    EpisodicMemory:
+      Enabled: False
+      Capacity: 50000
+      TopK: 4
+      MinFillBeforeRetrieve: 1024
+      RetrieveEvery: 4
+      UseNovelty: False
+      NoveltyThreshold: 0.0
+    Hawkes:
+      Enabled: False
+      LossWeight: 0.1
+    Settlement:
+      Enabled: True          # nan-masking fix in lob_heads.py makes this safe to enable
+      LossWeight: 0.25       # conservative starting weight; simplex will adjust
+
+  Agent:
+    dtype: float32
+    Policy: AC
+    Unimix_ratio: 0
+    AC:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EntropyCoef: 3.e-4
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.0e-4
+        Epsilon: 1.0e-4
+      Laprop:
+        LearningRate: 4.0e-4
+        Epsilon: 1.0e-19
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+    PPO:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EpsilonClip: 0.2
+      K_epochs: 3
+      Minibatch: 16384
+      CriticCoef: 1
+      EntropyCoef: 3.e-4
+      KL_threshold: 0.01
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.e-5
+        Epsilon: 1.0e-5
+      Laprop:
+        LearningRate: 4.0e-5
+        Epsilon: 1.0e-20
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+
+Wandb:
+  Init:
+    Mode: offline
+    Project: Drama_LOB_pretrain_a100
+n: lob

@@ -327,7 +327,7 @@ class WorldModel(nn.Module):
                     self._aux_weights[2] = 0.0
                 if not self.use_settlement_head:
                     self._aux_weights[3] = 0.0
-            self._aux_weights.copy_(self._simplex_project(self._aux_weights))
+                self._aux_weights.copy_(self._simplex_project(self._aux_weights))
             def _mask_grad_hook(grad):
                 mask = torch.ones_like(grad)
                 if not self.use_hawkes_head:
@@ -335,7 +335,7 @@ class WorldModel(nn.Module):
                 if not self.use_settlement_head:
                     mask[3] = 0.0
                 return grad * mask
-        self._aux_weights.register_hook(_mask_grad_hook)
+            self._aux_weights.register_hook(_mask_grad_hook)
         else:
             self.representation_loss_weight = _repr_w0
             self.direction_loss_weight = _dir_w0

@@ -18,7 +18,7 @@ Evaluate:
   EverySteps: 1000
 
 JointTrainAgent:
-  SampleMaxSteps: 15000   # Drives both the loop length and the cosine LR horizon (world_model.py t_max); 15k aligns annealing to the ~13k convergence point, early-stop still guards.
+  SampleMaxSteps: 50000   # Drives both the loop length and the cosine LR horizon (world_model.py t_max); 15k aligns annealing to the ~13k convergence point, early-stop still guards.
   EarlyStoppingPatience: 5
   SaveBestOnly: true
   BufferMaxLength: 50000
@@ -161,7 +161,7 @@ Models:
       Enabled: False                # Auxiliary Poisson NLL on buy/sell event counts; needs event_counts data.
       LossWeight: 0.1
     Settlement:
-      Enabled: False                # Auxiliary BCE on the binary contract outcome; needs outcome labels.
+      Enabled: True                # Auxiliary BCE on the binary contract outcome; needs outcome labels.
       LossWeight: 0.25
 
   Agent:

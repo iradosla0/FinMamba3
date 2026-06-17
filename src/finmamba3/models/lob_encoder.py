@@ -216,7 +216,7 @@ class StudentTLOBDecoder(nn.Module):
         self.mean_head = nn.Linear(in_dim, out_dim, **factory)
         self.log_scale_head = nn.Linear(in_dim, out_dim, **factory)
         # Stabilize log scale around log(0.1) early in training.
-        nn.init.constant_(self.log_scale_head.bias, math.log(0.1))
+        nn.init.constant_(self.log_scale_head.bias, math.log(0.5))
         nu = torch.full((out_dim,), float(nu_init), dtype=torch.float32)
         if learnable_nu:
             self.log_nu = nn.Parameter(nu.log())
@@ -235,7 +235,7 @@ class StudentTLOBDecoder(nn.Module):
 
         Returns a tensor with the same shape as `target`.
         """
-        nu = self.log_nu.exp().clamp(min=2.1, max=200.0).to(mean.dtype)
+        nu = self.log_nu.exp().clamp(min=5.0, max=200.0).to(mean.dtype)
         scale = log_scale.exp()
         z = (target - mean) / scale
         # Compute the log Student-t density.

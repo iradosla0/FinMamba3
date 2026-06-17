@@ -20,3 +20,4 @@ data/
 *.tar
 *.tar.zip
 handoff.md
+*.bak

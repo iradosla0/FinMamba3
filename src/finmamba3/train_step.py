@@ -20,11 +20,10 @@ _LOSS_NAMES = (
     "hawkes_loss",
     "settlement_loss",
     "regime_loss",
+    "film_gamma_dev",
+    "film_beta_mag",
+    "regime_entropy",
     "total_loss",
-    "lw_repr",
-    "lw_direction",
-    "lw_hawkes",
-    "lw_settlement",
 )
 
 
@@ -46,8 +45,8 @@ def train_world_model_step(
     for e in range(epoch):
         accum_stacks: list[list[torch.Tensor]] = [[] for _ in _LOSS_NAMES]
         for a in range(accum_steps):
-            obs, action, reward, termination, outcome = replay_buffer.sample(
-                batch_size, batch_length, imagine=False
+            obs, action, reward, termination, outcome, tte_frac, spot_dist = replay_buffer.sample(
+                batch_size, batch_length, imagine=False, with_supervision=True
             )
             losses = world_model.update(
                 obs,
@@ -60,6 +59,8 @@ def train_world_model_step(
                 accum_steps=accum_steps,
                 is_last_accum=(a == accum_steps - 1),
                 outcome=outcome,
+                time_to_expiry_frac=tte_frac,
+                spot_signed_distance=spot_dist,
             )
             if should_log:
                 for i, v in enumerate(losses):
@@ -70,9 +71,21 @@ def train_world_model_step(
             for name, value in zip(_LOSS_NAMES, means):
                 epoch_means[name].append(float(value))
     if should_log:
-        for name, values in epoch_means.items():
-            logger.log(
-                f"WorldModel/{name}",
-                float(np.mean(values)) if values else 0.0,
-                global_step=global_step,
-            )
+        mean_by_loss = {name: float(np.mean(values)) for name, values in epoch_means.items()}
+        for name, mean_value in mean_by_loss.items():
+            logger.log(f"WorldModel/{name}", mean_value, global_step=global_step)
+        # These per-step losses otherwise only reach wandb; echo the key terms to stdout so the
+        # trajectory is visible in the captured training log (and its HF logs/ upload) offline.
+        print(
+            f"[loss] step={global_step} "
+            f"total={mean_by_loss['total_loss']:.3f} "
+            f"recon={mean_by_loss['reconstruction_loss']:.3f} "
+            f"dyn_kl={mean_by_loss['dynamics_loss']:.3f} "
+            f"rep={mean_by_loss['representation_loss']:.3f} "
+            f"dir={mean_by_loss['direction_loss']:.3f} "
+            f"settle={mean_by_loss['settlement_loss']:.3f} "
+            f"film_g={mean_by_loss['film_gamma_dev']:.4f} "
+            f"film_b={mean_by_loss['film_beta_mag']:.4f} "
+            f"reg_H={mean_by_loss['regime_entropy']:.3f}",
+            flush=True,
+        )

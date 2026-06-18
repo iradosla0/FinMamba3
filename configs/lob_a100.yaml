@@ -18,10 +18,10 @@ Evaluate:
   EverySteps: 1000
 
 JointTrainAgent:
-  SampleMaxSteps: 3500    # ~8.5h at ~8.8 s/it on A100 with SISO. Cosine LR anneals
-                          # fully over this horizon. Raise to 5000 if the run finishes
-                          # early without plateauing; lower to 2000 for quick ablations.
-  EarlyStoppingPatience: 10  # Raised from 5: NLL baseline shifted with nu-clamp fix,
+  SampleMaxSteps: 10000    # ~8.5h at ~8.8 s/it on A100 with SISO. Cosine LR anneals
+  MarketCount: 8                        # fully over this horizon. Raise to 5000 if the run finishes
+  EarlyStopMetric: Val/reconstruction_loss                        # early without plateauing; lower to 2000 for quick ablations.
+  EarlyStoppingPatience: 5  # Raised from 5: NLL baseline shifted with nu-clamp fix,
                               # model needs more room to find new equilibrium.
   SaveBestOnly: true
   BufferMaxLength: 50000
@@ -73,7 +73,7 @@ Models:
     LRSchedule: cosine
     LRMinRatio: 0.1
     UseActionInput: True
-    DirectionThresholds: null
+    DirectionThresholds: [0.0001, 0.001, 0.005, 0.01]
     Dropout: 0.0           # Underfitting regime at this step count; dropout off.
                            # Re-enable for Phase B fine-tuning if overfitting appears.
     Unimix_ratio: 0.01

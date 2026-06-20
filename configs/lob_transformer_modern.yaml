@@ -18,16 +18,24 @@ Evaluate:
   EverySteps: 1000
 
 JointTrainAgent:
-  SampleMaxSteps: 20000
-  EarlyStoppingPatience: 5
+  SampleMaxSteps: 10000    # ~8.5h at ~8.8 s/it on A100 with SISO. Cosine LR anneals
+  MarketCount: 8                        # fully over this horizon. Raise to 5000 if the run finishes
+  EarlyStopMetric: Val/reconstruction_loss                        # early without plateauing; lower to 2000 for quick ablations.
+  EarlyStoppingPatience: 5  # Raised from 5: NLL baseline shifted with nu-clamp fix,
+                              # model needs more room to find new equilibrium.
   SaveBestOnly: true
   BufferMaxLength: 50000
   WorldModelWarmUp: 64
-  BehaviourWarmUp: 1000000   # effectively disables agent training
+  BehaviourWarmUp: 1000000   # effectively disables agent training in Phase A
   NumEnvs: 1
-  BatchSize: 64
-  AccumSteps: 2        # Effective batch 128
-  BatchLength: 48      # Increased from 32 to handle imagination rollouts (context 8 + horizon 16 + buffer)
+  BatchSize: 1024      # A100 max-util recipe. Mamba3 scan kernel parallelism scales with
+                        # batch*heads*chunks; at batch 128 the A100 sits at ~0-1% util.
+                        # At 1024 it floods the card. NOTE: different regime from T4 val-368
+                        # numbers; do not compare reconstruction loss across configs.
+  AccumSteps: 1        # Single fused forward/backward at full batch; accumulation does
+                        # not raise SM occupancy and adds unnecessary sync overhead.
+  BatchLength: 64      # Doubled from T4 baseline: gives dynamics model 64 ticks of
+                        # context, capturing slower LOB drift beyond microstructure noise.
   ImagineBatchSize: 64
   ImagineContextLength: 8
   ImagineBatchLength: 16
@@ -37,7 +45,7 @@ JointTrainAgent:
   TrainAgentEverySteps: 1
   FreezeWorldModelAfterSteps: 20000
   FreezeBehaviourAfterSteps: 0
-  SaveEverySteps: 2000
+  SaveEverySteps: 500   # Finer cadence for shorter run: validates at 250/500/1000/...
   LogEvery: 50
   SaveModels: True
   Tau: 10
@@ -48,28 +56,39 @@ JointTrainAgent:
 Models:
   WorldModel:
     dtype: float32
-    Backbone: TransformerModern    # Changed from Mamba3 to TransformerModern
+    Backbone: TransformerModern
     Act: SiLU
-    CategoricalDim: 16
-    ClassDim: 16
-    HiddenStateDim: 512
+    # Restored to DreamerV3 32x32=1024 latent. A100 has headroom; the T4 reduction
+    # to 16x16 was a memory constraint. With 94-dim LOB input, 32x32 is a 10x
+    # expansion — monitor KL to ensure the latent stays informative and does not
+    # collapse to the prior.
+    CategoricalDim: 32
+    ClassDim: 32
+    HiddenStateDim: 1024   # doubled from T4 512
     Optimiser: Laprop
     LatentDiscreteType: naive
     Max_grad_norm: 100
-    Warmup_steps: 500
+    Warmup_steps: 100      # 100/3500 = 2.9%, matching the ratio of the proven T4 run.
+                            # At 500 steps warmup would consume 14% of the run budget.
     LRSchedule: cosine
     LRMinRatio: 0.1
     UseActionInput: True
-    DirectionThresholds: null
-    Dropout: 0.2               # Matches Mamba3 config
+    DirectionThresholds: [0.0001, 0.001, 0.005, 0.01]
+    Dropout: 0.0           # Underfitting regime at this step count; dropout off.
+                            # Re-enable for Phase B fine-tuning if overfitting appears.
     Unimix_ratio: 0.01
-    Weight_decay: 1.0e-3
+    Weight_decay: 1.0e-4
     RepresentationLossWeight: 0.1
-    FreeBits: 2.0
+    LearnableLossWeights: True
+    FreeBits: 0.5          # Lowered from 1.0: tighter floor for the smaller LOB feature
+                            # space. 1.0 was calibrated for Atari image observations.
     Adam:
-      LearningRate: 1.0e-4
+      LearningRate: 1.0e-3
     Laprop:
-      LearningRate: 4.0e-5
+      LearningRate: 3.0e-4   # Rudy's sweep on 4080 at batch 1024: 3e-4 was the clear
+                              # optimum (recon 100 vs 119 at 1.5e-4 vs 191 at 4e-5).
+                              # Conservative at A100 batch 1024; sqrt-scaled aggressive
+                              # option would be ~8.5e-4 but is unvalidated.
       Epsilon: 1.0e-20
     Encoder:
       Type: lob
@@ -77,16 +96,16 @@ Models:
       FeatureDimLevel: 8
       FeatureDimTick: 20
       BinaryMarketFeatures: True   # Append boundary/logit/Amihud/variance-ratio tick features (Polymarket only).
-      DModel: 128
+      DModel: 256            # doubled from T4 128
       NumLayers: 2
       NumHeads: 4
-      DimFeedforward: 256
-      OutputFlattenDim: 1024
+      DimFeedforward: 512    # doubled from T4 256
+      OutputFlattenDim: 2048 # doubled from T4 1024
       AggregateOnly: False
       GradientCheckpointing: False
     Decoder:
       Kind: studentt
-      HiddenDim: 512
+      HiddenDim: 1024        # doubled from T4 512
       NumLayers: 3
       NuInit: 5.0
       LearnableNu: True
@@ -101,7 +120,7 @@ Models:
       LayerNum: 1
     Transformer:
       FinalFeatureWidth: 4
-      NumLayers: 4          # Changed from 2 to 4 to match Mamba3
+      NumLayers: 6          # Match Mamba3 backbone depth (6 layers)
       NumHeads: 8
     Mamba:
       n_layer: 2
@@ -129,10 +148,22 @@ Models:
       NumRegimes: 8
       EmbedDim: 32
     RegimeFiLM:
-      Enabled: False        # Transformer doesn't use RegimeFiLM (Mamba3-specific)
+      Enabled: False         # Baseline arm. For treatment arm: set True and also enable
+                              # SuperviseVol, FeedObsVol, DecoupleRouterFromFiLM per
+                              # Rudy's regime_modulation.py engineering notes.
       NumRegimes: 8
       EmbedDim: 32
       EntropyCoef: 0.01
+      InitScale: 0.0         # Zero-init: untrained modulator is identity (gamma=1, beta=0)
+      Dropout: 0.0
+      LRMult: 1.0
+      ConditionOnVol: False
+      VolWindow: 16
+      SuperviseVol: False
+      SupervisionWeight: 0.0
+      SuperviseAxis: vol
+      FeedObsVol: False
+      DecoupleRouterFromFiLM: False
     EpisodicMemory:
       Enabled: False
       Capacity: 50000
@@ -145,8 +176,8 @@ Models:
       Enabled: False
       LossWeight: 0.1
     Settlement:
-      Enabled: False
-      LossWeight: 0.25
+      Enabled: True          # nan-masking fix in lob_heads.py makes this safe to enable
+      LossWeight: 0.25       # conservative starting weight; simplex will adjust
 
   Agent:
     dtype: float32

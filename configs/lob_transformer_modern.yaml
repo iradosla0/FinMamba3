@@ -74,8 +74,8 @@ Models:
     LRMinRatio: 0.1
     UseActionInput: True
     DirectionThresholds: [0.0001, 0.001, 0.005, 0.01]
-    Dropout: 0.0           # Underfitting regime at this step count; dropout off.
-                            # Re-enable for Phase B fine-tuning if overfitting appears.
+    Dropout: 0.1           # Re-enabled: recon overfitting observed (loss going negative).
+                            # Light regularization to improve generalization.
     Unimix_ratio: 0.01
     Weight_decay: 1.0e-4
     RepresentationLossWeight: 0.1

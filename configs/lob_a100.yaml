@@ -80,7 +80,7 @@ Models:
     Weight_decay: 1.0e-4
     RepresentationLossWeight: 0.1
     LearnableLossWeights: True
-    FreeBits: 0.5          # Lowered from 1.0: tighter floor for the smaller LOB feature
+    FreeBits: 1.0          # Lowered from 1.0: tighter floor for the smaller LOB feature
                            # space. 1.0 was calibrated for Atari image observations.
     Adam:
       LearningRate: 1.0e-3

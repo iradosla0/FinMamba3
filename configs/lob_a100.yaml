@@ -68,7 +68,7 @@ Models:
     Optimiser: Laprop
     LatentDiscreteType: naive
     Max_grad_norm: 100
-    Warmup_steps: 100      # 100/3500 = 2.9%, matching the ratio of the proven T4 run.
+    Warmup_steps: 300      # 100/3500 = 2.9%, matching the ratio of the proven T4 run.
                            # At 500 steps warmup would consume 14% of the run budget.
     LRSchedule: cosine
     LRMinRatio: 0.1
@@ -157,17 +157,17 @@ Models:
                              # Rudy's regime_modulation.py engineering notes.
       NumRegimes: 8
       EmbedDim: 32
-      EntropyCoef: 0.01
+      EntropyCoef: 0.02
       InitScale: 0.0         # Zero-init: untrained modulator is identity (gamma=1, beta=0)
       Dropout: 0.0
       LRMult: 1.0
-      ConditionOnVol: False
+      ConditionOnVol: True
       VolWindow: 16
-      SuperviseVol: False
+      SuperviseVol: True
       SupervisionWeight: 0.0
       SuperviseAxis: vol
-      FeedObsVol: False
-      DecoupleRouterFromFiLM: False
+      FeedObsVol: True
+      DecoupleRouterFromFiLM: True
     EpisodicMemory:
       Enabled: False
       Capacity: 50000

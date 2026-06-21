@@ -152,7 +152,7 @@ Models:
       NumRegimes: 8
       EmbedDim: 32
     RegimeFiLM:
-      Enabled: False         # Baseline arm. For treatment arm: set True and also enable
+      Enabled: True         # Baseline arm. For treatment arm: set True and also enable
                              # SuperviseVol, FeedObsVol, DecoupleRouterFromFiLM per
                              # Rudy's regime_modulation.py engineering notes.
       NumRegimes: 8

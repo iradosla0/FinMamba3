@@ -279,15 +279,22 @@ def _upload_checkpoints_async(folder: str, repo_id: str, token: str, lock: threa
         if not lock.acquire(blocking=False):
             return
         try:
+            import logging as _logging
             from huggingface_hub import HfApi
-            HfApi().upload_folder(
-                folder_path=folder,
-                path_in_repo=path_in_repo,
-                repo_id=repo_id,
-                repo_type="model",
-                token=token,
-                commit_message="Periodic checkpoint sync during training",
-            )
+            _hf_logger = _logging.getLogger("huggingface_hub")
+            _prev_level = _hf_logger.level
+            _hf_logger.setLevel(_logging.ERROR)
+            try:
+                HfApi().upload_folder(
+                    folder_path=folder,
+                    path_in_repo=path_in_repo,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    token=token,
+                    commit_message="Periodic checkpoint sync during training",
+                )
+            finally:
+                _hf_logger.setLevel(_prev_level)
             logger.info(f"[ckpt-sync] uploaded {folder} -> {repo_id}")
         except Exception as exc:
             # A transient network error must not kill a multi-hour run; log and retry next cadence.
@@ -639,11 +646,13 @@ def main() -> None:
             logger.info(
                 f"[val] step={step} "
                 f"recon={val_metrics.get('Val/reconstruction_loss', float('nan')):.4f} "
+                f"mse={val_metrics.get('Val/normalized_next_mse', float('nan')):.4f} "
                 f"dir_acc={val_metrics.get('Val/mid_direction_accuracy', float('nan')):.4f} "
                 f"yes_log_loss={val_metrics.get('Val/yes_log_loss', float('nan')):.4f} "
-                f"yes_brier={val_metrics.get('Val/yes_brier', float('nan')):.4f}"
+                f"yes_brier={val_metrics.get('Val/yes_brier', float('nan')):.4f} "
+                f"spread_mae={val_metrics.get('Val/spread_mae', float('nan')):.5f} "
+                f"imbalance_mae={val_metrics.get('Val/imbalance_mae', float('nan')):.4f}"
             )
-
             # --- Early stopping & best checkpoint logic ---
             current_val_loss = val_metrics.get(early_stop_metric, float('inf'))
             if not np.isfinite(current_val_loss):
@@ -668,7 +677,12 @@ def main() -> None:
                     logger.info(f"no improvement for {patience_counter}/{early_stopping_patience} validations")
 
             dir_acc = val_metrics.get("Val/mid_direction_accuracy", float("nan"))
-            pbar.set_postfix(val_loss=f"{current_val_loss:.4f}", best=f"{best_val_loss:.4f}", dir_acc=f"{dir_acc:.3f}")
+            brier = val_metrics.get("Val/yes_brier", float("nan"))
+            pbar.set_postfix(
+                best=f"{best_val_loss:.4f}",
+                dir=f"{dir_acc:.3f}",
+                brier=f"{brier:.3f}",
+            )
 
             # Early stopping check
             if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
@@ -705,7 +719,9 @@ def main() -> None:
         logger.info(f"best checkpoint: {logdir}/ckpt/world_model_best.pth")
     if upload_every > 0:
         # Final synchronous flush so the very last weights land on HF before the process exits.
+        import logging as _logging
         from huggingface_hub import HfApi
+        _logging.getLogger("huggingface_hub").setLevel(_logging.ERROR)
         HfApi().upload_folder(
             folder_path=ckpt_root, path_in_repo=pre_args.ckpt_path_in_repo,
             repo_id=pre_args.ckpt_repo, repo_type="model", token=pre_args.hf_token,

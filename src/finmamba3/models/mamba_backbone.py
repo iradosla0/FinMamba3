@@ -225,8 +225,13 @@ class FinMambaSequenceModel(nn.Module):
                 nn.init.zeros_(layer.self_attn.out_proj.bias)
                 nn.init.normal_(layer.linear2.weight, std=0.02)
                 nn.init.zeros_(layer.linear2.bias)
+
+            self.attn_prefix_norm = nn.RMSNorm(d_model, **factory)
+            self.attn_gate = nn.Parameter(torch.zeros(1))
         else:
             self.attn_prefix = nn.ModuleList()
+            self.attn_prefix_norm = nn.Identity()
+            self.attn_gate = None
     def forward(self, samples, action, inference_params=None, return_regime=False,
                 regime_vol=None, **mixer_kwargs):
         if self.use_action_input:
@@ -234,23 +239,22 @@ class FinMambaSequenceModel(nn.Module):
             hidden_states = self.stem(torch.cat([samples, action], dim=-1))
         else:
             hidden_states = self.stem(samples)
-        # Infer the latent regime from the stem summary, optionally steered by a volatility feature, and
-        # emit per-block FiLM so the regime modulates each block's input and thus its input-dependent
-        # Delta, B and C. regime_vol, when supplied, is the realized volatility measured from the
         # observation midprice (shape [B, L, 1]); it gives the router the same axis the supervision label
         # and the eval split use. When omitted the modulator falls back to its caller-free latent proxy.
         # Apply short-range attention prefix before the SSM stack.
         if self.attn_prefix:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             _attn_dtype = hidden_states.dtype
-            # Run the attention prefix in float32 to prevent LayerNorm overflow
-            # under bfloat16 autocast at d_model=1024. Cast back afterward so
-            # the Mamba3 stem receives its expected dtype.
-            hidden_states = hidden_states.float()
+            prefix_input = hidden_states
+            attn_out = hidden_states.float()
+
             with sdpa_kernel(SDPBackend.MATH):
                 for attn_layer in self.attn_prefix:
-                    hidden_states = attn_layer(hidden_states)
-            hidden_states = hidden_states.to(_attn_dtype)
+                    attn_out = attn_layer(attn_out)
+
+            attn_out = self.attn_prefix_norm(attn_out).to(_attn_dtype)
+            hidden_states = prefix_input + self.attn_gate * (attn_out - prefix_input)
+
         regime_logits = None
         gammas = None
         betas = None

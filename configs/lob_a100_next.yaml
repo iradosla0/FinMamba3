@@ -132,6 +132,8 @@ Models:
         d_state: 16
     Mamba3:
       Enabled: true
+      attn_prefix_layers: 1    # 1 attention layer before the 6 Mamba3 layers
+      attn_num_heads: 8        # 1024 / 8 = 128 per head; divisible and reasonable
       n_layer: 6
       is_mimo: true
       mimo_rank: 4

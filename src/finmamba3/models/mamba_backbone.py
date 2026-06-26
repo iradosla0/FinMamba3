@@ -131,6 +131,8 @@ class FinMambaSequenceModel(nn.Module):
         regime_init_scale: float = 0.0,
         regime_dropout: float = 0.0,
         regime_decouple_router: bool = False,
+        attn_prefix_layers: int = 0,
+        attn_num_heads: int = 8,
         device=None,
         dtype=None,
     ) -> None:
@@ -198,6 +200,30 @@ class FinMambaSequenceModel(nn.Module):
             )
         else:
             self.regime_modulator = None
+        else:
+            self.regime_modulator = None
+        # Optional short-range attention prefix applied before the Mamba stack.
+        # Mixes information across all sequence positions simultaneously so the
+        # SSM receives attention-enriched representations rather than raw stem
+        # output. Particularly useful for short-range direction prediction where
+        # the last 3-10 ticks are most informative. Uses pre-norm + SDPA math
+        # backend (same fix as lob_encoder.py) to avoid grid-limit crash at
+        # large batch sizes.
+        if attn_prefix_layers > 0:
+            self.attn_prefix = nn.ModuleList([
+                nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=attn_num_heads,
+                    dim_feedforward=d_model * 2,
+                    dropout=dropout_p,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(attn_prefix_layers)
+            ])
+        else:
+            self.attn_prefix = nn.ModuleList()
     def forward(self, samples, action, inference_params=None, return_regime=False,
                 regime_vol=None, **mixer_kwargs):
         if self.use_action_input:
@@ -210,6 +236,12 @@ class FinMambaSequenceModel(nn.Module):
         # Delta, B and C. regime_vol, when supplied, is the realized volatility measured from the
         # observation midprice (shape [B, L, 1]); it gives the router the same axis the supervision label
         # and the eval split use. When omitted the modulator falls back to its caller-free latent proxy.
+        # Apply short-range attention prefix before the SSM stack.
+        if self.attn_prefix:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            with sdpa_kernel(SDPBackend.MATH):
+                for attn_layer in self.attn_prefix:
+                    hidden_states = attn_layer(hidden_states)
         regime_logits = None
         gammas = None
         betas = None

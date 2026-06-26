@@ -80,8 +80,8 @@ def train_world_model_step(
             f"[loss] step={global_step} "
             f"total={mean_by_loss['total_loss']:.3f} "
             f"recon={mean_by_loss['reconstruction_loss']:.3f} "
-            f"dyn_kl={mean_by_loss['dynamics_loss']:.3f} "
-            f"rep={mean_by_loss['representation_loss']:.3f} "
+            f"dyn_kl={mean_by_loss['dynamics_real_kl_div']:.3f} "
+            f"rep={mean_by_loss['representation_real_kl_div']:.3f} "
             f"dir={mean_by_loss['direction_loss']:.3f} "
             f"settle={mean_by_loss['settlement_loss']:.3f} "
             f"film_g={mean_by_loss['film_gamma_dev']:.4f} "
@@ -89,3 +89,4 @@ def train_world_model_step(
             f"reg_H={mean_by_loss['regime_entropy']:.3f}",
             flush=True,
         )
+

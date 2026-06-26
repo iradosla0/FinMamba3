@@ -222,6 +222,13 @@ class FinMambaSequenceModel(nn.Module):
                 )
                 for _ in range(attn_prefix_layers)
             ])
+            # Near-zero init on the attention output projection so the prefix
+            # starts close to identity and doesn't destabilize Mamba3 early in training.
+            for layer in self.attn_prefix:
+                nn.init.normal_(layer.self_attn.out_proj.weight, std=0.02)
+                nn.init.zeros_(layer.self_attn.out_proj.bias)
+                nn.init.normal_(layer.linear2.weight, std=0.02)
+                nn.init.zeros_(layer.linear2.bias)
         else:
             self.attn_prefix = nn.ModuleList()
     def forward(self, samples, action, inference_params=None, return_regime=False,

@@ -242,6 +242,7 @@ class FinMambaSequenceModel(nn.Module):
         # Apply short-range attention prefix before the SSM stack.
         if self.attn_prefix:
             from torch.nn.attention import sdpa_kernel, SDPBackend
+            _attn_dtype = hidden_states.dtype
             with sdpa_kernel(SDPBackend.MATH):
                 for attn_layer in self.attn_prefix:
                     hidden_states = attn_layer(hidden_states).to(_attn_dtype)

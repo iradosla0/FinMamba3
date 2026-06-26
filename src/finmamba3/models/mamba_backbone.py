@@ -244,7 +244,7 @@ class FinMambaSequenceModel(nn.Module):
             from torch.nn.attention import sdpa_kernel, SDPBackend
             with sdpa_kernel(SDPBackend.MATH):
                 for attn_layer in self.attn_prefix:
-                    hidden_states = attn_layer(hidden_states)
+                    hidden_states = attn_layer(hidden_states).to(_attn_dtype)
         regime_logits = None
         gammas = None
         betas = None

@@ -675,7 +675,7 @@ def main() -> None:
                 logger.info(f"early stopping triggered at step {step}, best was {best_val_loss:.4f} at step {best_step}")
                 break
         if step > 0 and step % imagine_every == 0:
-            _imagine_and_log(world_model, val_seq, wlogger, step)
+            _imagine_and_log(world_model, val_seq, wlogger, step, context_len=config.JointTrainAgent.ImagineContextLength)
         if step > 0 and step % save_every == 0:
             torch.save(
                 {"step": step, "world_model": world_model.state_dict(),

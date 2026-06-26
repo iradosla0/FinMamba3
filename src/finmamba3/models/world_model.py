@@ -232,6 +232,8 @@ class WorldModel(nn.Module):
                 regime_init_scale=self.regime_film_init_scale,
                 regime_dropout=self.regime_film_dropout,
                 regime_decouple_router=self.regime_film_decouple_router,
+                attn_prefix_layers=int(mamba3_cfg.get('attn_prefix_layers', 0)),
+                attn_num_heads=int(mamba3_cfg.get('attn_num_heads', 8)),
                 dtype=config.Models.WorldModel.dtype,
                 device=device,
             )

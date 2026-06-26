@@ -200,8 +200,6 @@ class FinMambaSequenceModel(nn.Module):
             )
         else:
             self.regime_modulator = None
-        else:
-            self.regime_modulator = None
         # Optional short-range attention prefix applied before the Mamba stack.
         # Mixes information across all sequence positions simultaneously so the
         # SSM receives attention-enriched representations rather than raw stem
@@ -222,8 +220,6 @@ class FinMambaSequenceModel(nn.Module):
                 )
                 for _ in range(attn_prefix_layers)
             ])
-            # Near-zero init on the attention output projection so the prefix
-            # starts close to identity and doesn't destabilize Mamba3 early in training.
             for layer in self.attn_prefix:
                 nn.init.normal_(layer.self_attn.out_proj.weight, std=0.02)
                 nn.init.zeros_(layer.self_attn.out_proj.bias)

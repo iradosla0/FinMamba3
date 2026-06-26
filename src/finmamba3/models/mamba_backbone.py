@@ -243,9 +243,14 @@ class FinMambaSequenceModel(nn.Module):
         if self.attn_prefix:
             from torch.nn.attention import sdpa_kernel, SDPBackend
             _attn_dtype = hidden_states.dtype
+            # Run the attention prefix in float32 to prevent LayerNorm overflow
+            # under bfloat16 autocast at d_model=1024. Cast back afterward so
+            # the Mamba3 stem receives its expected dtype.
+            hidden_states = hidden_states.float()
             with sdpa_kernel(SDPBackend.MATH):
                 for attn_layer in self.attn_prefix:
-                    hidden_states = attn_layer(hidden_states).to(_attn_dtype)
+                    hidden_states = attn_layer(hidden_states)
+            hidden_states = hidden_states.to(_attn_dtype)
         regime_logits = None
         gammas = None
         betas = None

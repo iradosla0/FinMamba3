@@ -1,0 +1,253 @@
+BasicSettings:
+  ObsMode: features
+  FeatureDim: 100
+  ReplayBufferOnGPU: True
+  Seed: 3710
+  Env_name: LOB
+  Device: cuda:0
+  Use_amp: True
+  NormClip: 8.0
+  Use_cg: False
+  Compile: False
+  SavePath: None
+
+Evaluate:
+  EpisodeNum: 10
+  NumEnvs: 1
+  DuringTraining: False
+  EverySteps: 1000
+
+JointTrainAgent:
+  SampleMaxSteps: 6000        # CHANGED from 10000: fits 14.7h budget at ~8.9s/it with margin
+  MarketCount: 8
+  EarlyStopMetric: Val/reconstruction_loss
+  EarlyStoppingPatience: 5
+  SaveBestOnly: true
+  BufferMaxLength: 50000
+  WorldModelWarmUp: 64
+  BehaviourWarmUp: 1000000
+  NumEnvs: 1
+  BatchSize: 2048             # CHANGED from 1024: uses free VRAM headroom (~34GB free);
+                              # keeps per-step time flat while doubling gradient signal per step.
+                              # 6000 steps at batch 2048 = ~12000 effective samples vs 1024.
+                              # Run 20-step smoke test first to confirm time stays ~8.9s/it.
+  AccumSteps: 1
+  BatchLength: 64             # unchanged — BatchLength increase would add ~30% per-step time,
+                              # incompatible with 14.7h budget
+  ImagineBatchSize: 64
+  ImagineContextLength: 32    # CHANGED from 8: gives Mamba3 SSM more real ticks to accumulate
+                              # state before direction head is queried during validation.
+                              # Transformer sees full context via attention; Mamba3 needs more
+                              # ticks to compress equivalent information into its recurrent state.
+  ImagineBatchLength: 16
+  RealityContextLength: 16
+  TrainDynamicsEverySteps: 1
+  TrainDynamicsEpoch: 1
+  TrainAgentEverySteps: 1
+  FreezeWorldModelAfterSteps: 20000
+  FreezeBehaviourAfterSteps: 0
+  SaveEverySteps: 500
+  LogEvery: 50
+  SaveModels: True
+  Tau: 10
+  ImaginationTau: 10
+  Alpha: 1.0
+  Beta: 1.0
+
+Models:
+  WorldModel:
+    dtype: float32
+    Backbone: Mamba3
+    Act: SiLU
+    CategoricalDim: 32
+    ClassDim: 32
+    HiddenStateDim: 1024
+    Optimiser: Laprop
+    LatentDiscreteType: naive
+    Max_grad_norm: 100
+    Warmup_steps: 300          # CHANGED from 100: confirmed fix for KL collapse from
+                               # transformer-modern-merge branch; 300 steps gives the encoder
+                               # time to establish a useful posterior before dynamics model
+                               # learns to bypass the latent at full LR.
+    LRSchedule: cosine
+    LRMinRatio: 0.1
+    UseActionInput: True
+    DirectionThresholds: [0.0001, 0.001, 0.005, 0.01]  # unchanged — confirmed working
+    Dropout: 0.1               # CHANGED from 0.0: re-enabled per transformer-modern-merge
+                               # branch observation that recon overfitting occurred without it.
+    Unimix_ratio: 0.01
+    Weight_decay: 1.0e-4
+    RepresentationLossWeight: 0.1   # unchanged — correct DreamerV3 default; controls encoder
+                                    # regularization only, not predictive capability (dynamics_loss
+                                    # at weight 1.0 is what keeps the model predictive).
+    LearnableLossWeights: False     # CHANGED from True: learned weights gave direction 46% of
+                                    # auxiliary budget but reconstruction entering unnormalized at
+                                    # weight 1.0 still dominated. Fixed weights below are calibrated
+                                    # to give direction and settlement enough absolute gradient mass
+                                    # to compete directly with reconstruction.
+    FreeBits: 1.0              # CHANGED from 0.5: confirmed fix for KL collapse; held KL at
+                               # ~1.5 at step 3000 in the transformer-modern-merge run vs
+                               # collapse to 0.6 within 1500 steps at FreeBits=0.5.
+    Adam:
+      LearningRate: 1.0e-3
+    Laprop:
+      LearningRate: 3.0e-4
+      Epsilon: 1.0e-20
+    Encoder:
+      Type: lob
+      K: 10
+      FeatureDimLevel: 8
+      FeatureDimTick: 20
+      BinaryMarketFeatures: True
+      DModel: 256
+      NumLayers: 2
+      NumHeads: 4
+      DimFeedforward: 512
+      OutputFlattenDim: 2048
+      AggregateOnly: False
+      GradientCheckpointing: False
+    Decoder:
+      Kind: studentt
+      HiddenDim: 1024
+      NumLayers: 3
+      NuInit: 5.0
+      LearnableNu: True
+      SizeWeight: 2.0
+    Reward:
+      Enabled: false
+      HiddenUnits: 256
+      LayerNum: 1
+    Termination:
+      Enabled: false
+      HiddenUnits: 256
+      LayerNum: 1
+    Transformer:
+      FinalFeatureWidth: 4
+      NumLayers: 2
+      NumHeads: 8
+    Mamba:
+      n_layer: 2
+      d_intermediate: 0
+      ssm_cfg:
+        d_state: 16
+    Mamba3:
+      Enabled: true
+      n_layer: 6
+      is_mimo: true
+      mimo_rank: 4
+      d_state: 128
+      headdim: 64
+      chunk_size: 8
+      is_outproj_norm: false
+      rope_fraction: 0.25      # CHANGED from 0.5: less positional encoding bias, more
+                               # content-based state transitions; benefits direction prediction
+                               # where recent tick content matters more than position.
+    Direction:
+      Enabled: True
+      NumClasses: 3
+      Threshold: 0.01
+      LossWeight: 3.0          # CHANGED from 0.5: primary lever for dir_acc improvement.
+                               # Previous effective contribution was 0.5 * ~0.46 simplex share
+                               # of auxiliary budget, dwarfed by reconstruction at weight 1.0.
+                               # Fixed weight 3.0 gives direction enough absolute gradient mass
+                               # to compete. Target: beat TransformerModern dir_acc=0.461.
+      Dropout: 0.0
+    Regime:
+      Enabled: False
+      NumRegimes: 8
+      EmbedDim: 32
+    RegimeFiLM:
+      Enabled: False           # confirmed null result — gauge absorption means FiLM conditioning
+                               # folds into SSM weights; optimizer finds zero-modulation basin.
+      NumRegimes: 8
+      EmbedDim: 32
+      EntropyCoef: 0.01
+      InitScale: 0.0
+      Dropout: 0.0
+      LRMult: 1.0
+      ConditionOnVol: False
+      VolWindow: 16
+      SuperviseVol: False
+      SupervisionWeight: 0.0
+      SuperviseAxis: vol
+      FeedObsVol: False
+      DecoupleRouterFromFiLM: False
+    EpisodicMemory:
+      Enabled: False
+      Capacity: 50000
+      TopK: 4
+      MinFillBeforeRetrieve: 1024
+      RetrieveEvery: 4
+      UseNovelty: False
+      NoveltyThreshold: 0.0
+    Hawkes:
+      Enabled: False
+      LossWeight: 0.1
+    Settlement:
+      Enabled: True
+      LossWeight: 2.0          # CHANGED from 0.25: raised to give settlement enough gradient
+                               # to compete with reconstruction. Target: beat TransformerModern
+                               # yes_brier=0.081 and yes_log_loss=0.291.
+      TTEWeighted: True        # CHANGED from False (default): downweights near-expiry ticks
+                               # where outcome is nearly certain and BCE is trivially low;
+                               # forces model to learn real predictive signal on early-life ticks.
+      SpotSignAux: True        # CHANGED from False (default): adds dense pre-expiry auxiliary
+                               # supervision using underlying spot price direction as a proxy
+                               # for binary outcome. Gives settlement head gradient at every
+                               # tick instead of only when yes_outcome is known — directly
+                               # addresses the sparse-label problem that kept settlement stuck.
+      SpotSignWeight: 0.5      # weight on the spot-sign auxiliary term within settlement loss
+
+  Agent:
+    dtype: float32
+    Policy: AC
+    Unimix_ratio: 0
+    AC:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EntropyCoef: 3.e-4
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.0e-4
+        Epsilon: 1.0e-4
+      Laprop:
+        LearningRate: 4.0e-4
+        Epsilon: 1.0e-19
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+    PPO:
+      NumLayers: 3
+      Gamma: 0.985
+      Lambda: 0.95
+      EpsilonClip: 0.2
+      K_epochs: 3
+      Minibatch: 16384
+      CriticCoef: 1
+      EntropyCoef: 3.e-4
+      KL_threshold: 0.01
+      Max_grad_norm: 100
+      Warmup_steps: 1000
+      Act: SiLU
+      Optimiser: Laprop
+      Adam:
+        LearningRate: 3.e-5
+        Epsilon: 1.0e-5
+      Laprop:
+        LearningRate: 4.0e-5
+        Epsilon: 1.0e-20
+      Actor:
+        HiddenUnits: 256
+      Critic:
+        HiddenUnits: 512
+
+Wandb:
+  Init:
+    Mode: offline
+    Project: Drama_LOB_pretrain_a100
+n: lob

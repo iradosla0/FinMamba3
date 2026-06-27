@@ -939,6 +939,28 @@ class WorldModel(nn.Module):
                 + _set_w * settlement_loss
                 + regime_loss
             )
+        # Per-component NaN diagnostic — fires before the skip counter so we get
+        # a breakdown on the *first* bad step, not only after 5 accumulations.
+        if global_step < self.nan_guard_steps and not torch.isfinite(total_loss):
+            def _scalar(t):
+                try:
+                    return t.item()
+                except Exception:
+                    return float("nan")
+            print(
+                f"[NaN-diag] step={global_step} "
+                f"total={_scalar(total_loss):.4f} "
+                f"recon={_scalar(reconstruction_loss):.4f} "
+                f"reward={_scalar(reward_loss):.4f} "
+                f"term={_scalar(termination_loss):.4f} "
+                f"dyn={_scalar(dynamics_loss):.4f} "
+                f"repr={_scalar(representation_loss):.4f} "
+                f"dir={_scalar(direction_loss):.4f} "
+                f"hawkes={_scalar(hawkes_loss):.4f} "
+                f"settle={_scalar(settlement_loss):.4f} "
+                f"regime={_scalar(regime_loss):.4f}",
+                flush=True,
+            )
         # Catch bf16 selective_scan blowups during early training.
         # Skipping the backward and optimizer step here keeps the rest of the run salvageable instead of propagating NaN parameters everywhere.
         if global_step < self.nan_guard_steps and not torch.isfinite(total_loss):

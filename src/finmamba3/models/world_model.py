@@ -789,6 +789,23 @@ class WorldModel(nn.Module):
             else:
                 dist_feat = self.sequence_model(flattened_sample, action)
             conditioned_dist_feat = self.condition_dist_feat(dist_feat)
+            # One-time NaN position diagnostic — remove after confirming root cause.
+            if not hasattr(self, '_nan_diag_done'):
+                nan_mask = ~torch.isfinite(conditioned_dist_feat)
+                if nan_mask.any():
+                    nan_positions = nan_mask.any(dim=-1)
+                    print(f"[dist_feat NaN] timesteps with NaN: {nan_positions.any(dim=0).nonzero().squeeze().tolist()}")
+                    print(f"[dist_feat NaN] fraction of (B,L) with NaN: {nan_mask.any(dim=-1).float().mean():.4f}")
+                    print(f"[dist_feat NaN] last position NaN fraction: {nan_mask[:, -1].any(dim=-1).float().mean():.4f}")
+                    print(f"[dist_feat NaN] first position NaN fraction: {nan_mask[:, 0].any(dim=-1).float().mean():.4f}")
+                else:
+                    print("[dist_feat NaN] no NaN in conditioned_dist_feat")
+                self._nan_diag_done = True
+            # Defensive NaN guard — replaces any non-finite values before they
+            # propagate into prediction heads.
+            conditioned_dist_feat = torch.nan_to_num(
+                conditioned_dist_feat, nan=0.0, posinf=1.0, neginf=-1.0
+            )
             # Episodic-memory fusion retrieves top-K nearest past hidden states using the most recent step as the query.
             # Retrieved values are broadcast across the sequence and fused via a gated residual.
             # Retrieval is CPU-bound, so it is throttled by RetrieveEvery and skipped until the memory holds MinFillBeforeRetrieve entries.

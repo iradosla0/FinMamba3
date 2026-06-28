@@ -869,7 +869,7 @@ class WorldModel(nn.Module):
             # Settlement auxiliary predicts the binary contract outcome from the latent.
             # The term only contributes when outcome is provided as a broadcastable scalar per sequence with shape (B,) or (B, L).
             if self.use_settlement_head and outcome is not None:
-                settle_logits = self.settlement_head(conditioned_dist_feat).reshape(-1)
+                settle_logits = self.settlement_head(conditioned_dist_feat.float()).reshape(-1)
                 outcome_flat = outcome.reshape(-1).to(dtype=settle_logits.dtype)
                 if outcome_flat.shape[0] != settle_logits.shape[0] and outcome.dim() == 1:
                     outcome_flat = outcome.unsqueeze(1).expand(-1, conditioned_dist_feat.shape[1]).reshape(-1).to(dtype=settle_logits.dtype)

@@ -247,7 +247,8 @@ class SettlementHead(nn.Module):
         if time_to_expiry_frac is None:
             return (per * mask).sum() / mask.sum().clamp(min=1.0)
         weight = (1.0 - time_to_expiry_frac.clamp(min=0.0, max=1.0)).to(logits.dtype)
-        return (per * weight * mask).sum() / mask.sum().clamp(min=1.0)
+        weight = weight.clamp(min=0.05)  # floor prevents near-zero weights producing NaN gradients under bf16
+        return (per * weight * mask).sum() / (weight * mask).sum().clamp(min=1e-6)
     @staticmethod
     def spot_sign_bce(
         logits: torch.Tensor,

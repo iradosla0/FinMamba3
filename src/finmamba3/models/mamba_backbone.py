@@ -227,7 +227,7 @@ class FinMambaSequenceModel(nn.Module):
                 nn.init.zeros_(layer.linear2.bias)
 
             self.attn_prefix_norm = nn.RMSNorm(d_model, **factory)
-            self.attn_gate = nn.Parameter(torch.zeros(1))
+            self.attn_gate = nn.Parameter(torch.full((1,), -4.0))
         else:
             self.attn_prefix = nn.ModuleList()
             self.attn_prefix_norm = nn.Identity()
@@ -253,7 +253,7 @@ class FinMambaSequenceModel(nn.Module):
                     attn_out = attn_layer(attn_out)
 
             attn_out = self.attn_prefix_norm(attn_out).to(_attn_dtype)
-            hidden_states = prefix_input + self.attn_gate * (attn_out - prefix_input)
+            hidden_states = prefix_input + self.attn_gate.sigmoid() * (attn_out - prefix_input)
 
         regime_logits = None
         gammas = None
